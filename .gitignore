@@ -1,0 +1,8 @@
+# 系统/编辑器杂项
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# 若在仓库里直接放书试读，KOReader 会生成侧车目录
+*.sdr/
