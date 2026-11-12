@@ -15,16 +15,19 @@
 | 适用软件 | KOReader，**必须为 nightly（master）版本**，见[安装须知 #1](#1-必须使用-koreader-nightlymaster) |
 | 适用文件 | KOReader 能打开的所有格式（txt / md / html / epub / pdf / fb2 / mobi / azw3 / cbz…） |
 | 依赖 | 仅依赖 KOReader 自带模块（`luasocket`、`lfs`、`ffi`），不需要额外安装库 |
-| 插件存储 | 配置 `koreader/settings/webdavreader.lua`、进度 `koreader/settings/webdavreader_progress.json`、缓存 `koreader/data/webdavreader_cache/` |
+| 插件存储 | 配置 `koreader/settings/webdavreader.lua`、进度 `koreader/settings/webdavreader_progress.json`、移动位置历史 `koreader/settings/webdavreader_history.json`、缓存 `koreader/data/webdavreader_cache/` |
 
 功能一览：
 
 | 能力 | 说明 |
 |---|---|
 | 直接打开 | 点击文件即下载到临时缓存并打开，无需选择保存位置 |
+| 返回上一级 | 子目录顶部置顶一行 `⬆ ../`，点一下就回上一层；也可用左下角返回箭头或长按左上角按钮 |
 | 进度独立 | 进度存在插件自己的 JSON，按键值（服务器 + 远程路径）保存，不依赖侧车文件 |
 | 缓存管理 | 容量上限 + LRU 自动淘汰，默认关闭书籍后清理该文件缓存 |
 | 远程文件管理 | 删除（含目录递归）、移动、重命名、新建目录 |
+| 目录排序 | 名称 / 名称（自然排序）/ 修改时间 / 创建时间 / 大小 / 类型，可升降序、可切换目录优先；选择会被记住 |
+| 移动快捷位置 | 「移动」时直接选最近用过的目标目录，一键移动；也可手动输入其他位置 |
 | 多服务器 | 可配置多个 WebDAV 账号，设置默认服务器 |
 
 详细使用说明见 [USAGE.md](USAGE.md)；模块职责、依赖与排障见 [TECHNICAL.md](TECHNICAL.md)；内部接口契约见 [INTERFACE.md](INTERFACE.md)。
@@ -55,10 +58,12 @@
        ├── browser.lua
        ├── cache.lua
        ├── config.lua
+       ├── history.lua
        ├── json.lua
        ├── manager.lua
        ├── progress.lua
        ├── session.lua
+       ├── sort.lua
        ├── store.lua
        └── webdav.lua
    ```
@@ -112,13 +117,15 @@ nightly 安装方法：
 |---|---|
 | 服务器配置 | `koreader/settings/webdavreader.lua` |
 | 阅读进度 | `koreader/settings/webdavreader_progress.json` |
+| 移动位置历史 | `koreader/settings/webdavreader_history.json` |
+| 浏览状态（上次目录、排序偏好） | `koreader/settings/webdavreader_state.lua` |
 | 临时缓存 | `koreader/data/webdavreader_cache/` |
 
 清缓存不影响进度；把 `webdavreader_progress.json` 复制到另一台设备可继续阅读。缓存默认在关闭书籍后清理，可在「缓存设置」里改为保留，并设置容量上限。
 
 ### 4. 卸载
 
-删除 `koreader/plugins/webdavreader.koplugin` 目录并重启 KOReader 即可。如需彻底清除，再删除上面表格中的配置、进度和缓存文件。
+删除 `koreader/plugins/webdavreader.koplugin` 目录并重启 KOReader 即可。如需彻底清除，再删除上面表格中的配置、进度、历史、状态和缓存文件。
 
 ## 许可证
 

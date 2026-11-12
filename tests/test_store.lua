@@ -304,6 +304,241 @@ function M.run(T)
         T.ok(#Store.shortHash(nil) > 0)
     end)
 
+    -- ---------------- 通用 JSON 文档存储（newJsonStore） ----------------
+    -- 以下为追加用例，不改动上面任何既有断言。
+
+    -- 内存文件系统版 JsonStore
+    local function memJsonStore(opts)
+        opts = opts or {}
+        local files = opts.files or {}
+        local writes = 0
+        local store = Store.newJsonStore({
+            path = opts.path or "/virtual/doc.json",
+            default_data = opts.default_data or function()
+                return { version = 1, servers = {} }
+            end,
+            readfile = function(p) return files[p] end,
+            writefile = function(p, content)
+                files[p] = content
+                writes = writes + 1
+                if opts.write_ok == false then return nil, "disk full" end
+                return true
+            end,
+            encode = opts.encode or function(t) return json.encode(t) end,
+            decode = opts.decode or function(s)
+                local d, e = json.decode(s)
+                if e then error(e) end
+                return d
+            end,
+        })
+        return store, files, function() return writes end
+    end
+
+    T.test("newJsonStore 构造后是 table 且不读盘", function()
+        local reads = 0
+        local store = Store.newJsonStore({
+            path = "/virtual/lazy.json",
+            readfile = function() reads = reads + 1 return nil end,
+            writefile = function() return true end,
+            encode = function(t) return json.encode(t) end,
+            decode = function(s) return json.decode(s) end,
+        })
+        T.is_table(store, "应返回 store 对象")
+        T.eq(reads, 0, "构造时不应读盘")
+    end)
+
+    T.test("newJsonStore 懒加载：getData 只读一次盘", function()
+        local reads = 0
+        local files = { ["/virtual/lazy.json"] = '{"version":1,"servers":{}}' }
+        local store = Store.newJsonStore({
+            path = "/virtual/lazy.json",
+            readfile = function(p) reads = reads + 1 return files[p] end,
+            writefile = function(p, c) files[p] = c return true end,
+            encode = function(t) return json.encode(t) end,
+            decode = function(s) return json.decode(s) end,
+        })
+        store:getData()
+        T.eq(reads, 1)
+        store:getData()
+        store:load()
+        T.eq(reads, 1, "重复取数据不应重复读盘")
+    end)
+
+    T.test("newJsonStore 使用 default_data 的形状", function()
+        local store = memJsonStore()
+        local data = store:getData()
+        T.is_table(data)
+        T.eq(data.version, 1)
+        T.is_table(data.servers)
+    end)
+
+    T.test("newJsonStore 缺省 default_data 时给空 table", function()
+        local store = Store.newJsonStore({ path = "/virtual/nod.json" })
+        T.is_table(store:getData())
+    end)
+
+    T.test("newJsonStore 文件不存在视为成功", function()
+        local store = memJsonStore()
+        T.eq(store:load(), true)
+        T.is_table(store:getData())
+    end)
+
+    T.test("newJsonStore 空文件视为成功", function()
+        local store = memJsonStore({ files = { ["/virtual/doc.json"] = "" } })
+        T.eq(store:load(), true)
+        T.eq(store:getData().version, 1)
+    end)
+
+    T.test("newJsonStore dirty 语义：setData 置位 / flush 清除", function()
+        local store, files = memJsonStore()
+        T.eq(store:isDirty(), false, "初始不脏")
+        store:setData({ version = 1, servers = { a = {} } })
+        T.eq(store:isDirty(), true, "setData 后应脏")
+        T.eq(store:flush(), true)
+        T.eq(store:isDirty(), false, "flush 后不脏")
+        T.ok(files["/virtual/doc.json"], "应落盘")
+    end)
+
+    T.test("newJsonStore markDirty", function()
+        local store = memJsonStore()
+        store:getData()
+        T.eq(store:isDirty(), false)
+        store:markDirty()
+        T.eq(store:isDirty(), true)
+    end)
+
+    T.test("newJsonStore flushIfDirty 无改动不写", function()
+        local store, _, writes = memJsonStore()
+        store:setData({ version = 1, servers = {} })
+        store:flush()
+        local before = writes()
+        T.eq(store:flushIfDirty(), true)
+        T.eq(writes(), before, "不脏时不应重写")
+        store:markDirty()
+        store:flushIfDirty()
+        T.eq(writes(), before + 1, "脏时应写入")
+    end)
+
+    T.test("newJsonStore 无 path 时 flush 失败但不崩溃", function()
+        local store = Store.newJsonStore({ encode = function(t) return json.encode(t) end })
+        local ok, err = store:flush()
+        T.eq(ok, false)
+        T.eq(err, "no path")
+    end)
+
+    T.test("newJsonStore 无 encoder 时 flush 返回 no encoder", function()
+        local store = Store.newJsonStore({
+            path = "/virtual/noenc.json",
+            readfile = function() return nil end,
+        })
+        local ok, err = store:flush()
+        T.eq(ok, false)
+        T.eq(err, "no encoder")
+    end)
+
+    T.test("newJsonStore 无 decoder 时 load 返回 false 但不丢数据", function()
+        local store = Store.newJsonStore({
+            path = "/virtual/nodec.json",
+            readfile = function() return '{"version":1,"servers":{}}' end,
+            writefile = function() return true end,
+            encode = function(t) return json.encode(t) end,
+        })
+        T.eq(store:load(), false, "没有解码器时 load 返回 false")
+        T.is_table(store:getData(), "仍能拿到默认数据")
+    end)
+
+    T.test("newJsonStore setCodec 后置注入", function()
+        local files = {}
+        local store = Store.newJsonStore({
+            path = "/virtual/late.json",
+            readfile = function(p) return files[p] end,
+            writefile = function(p, c) files[p] = c return true end,
+        })
+        T.eq(store:flush(), false, "注入前无 encoder 不能写")
+        store:setCodec(function(t) return json.encode(t) end, function(s)
+            local d, e = json.decode(s)
+            if e then error(e) end
+            return d
+        end)
+        store:setData({ version = 1, servers = {} })
+        T.eq(store:flush(), true, "注入后应能写")
+        T.eq(type(files["/virtual/late.json"]), "string")
+    end)
+
+    T.test("newJsonStore 容忍损坏的 JSON 并备份", function()
+        local backups = {}
+        local store = Store.newJsonStore({
+            path = "/virtual/bad.json",
+            default_data = function() return { version = 1, servers = {} } end,
+            readfile = function() return "{ this is not json" end,
+            writefile = function(p, c) backups[p] = c return true end,
+            encode = function(t) return json.encode(t) end,
+            decode = function(s)
+                local d, e = json.decode(s)
+                if e then error(e) end
+                return d
+            end,
+        })
+        T.eq(store:load(), false, "损坏文件 load 返回 false")
+        T.eq(store:getData().version, 1, "应从 default_data 重建")
+        local found = false
+        for p in pairs(backups) do
+            if p:find("%.corrupt%-") then found = true end
+        end
+        T.ok(found, "损坏文件应被备份为 .corrupt-<时间戳>")
+    end)
+
+    T.test("newJsonStore 编码器抛错时返回 false, err", function()
+        local store = Store.newJsonStore({
+            path = "/virtual/e.json",
+            readfile = function() return nil end,
+            writefile = function() return true end,
+            encode = function() error("boom") end,
+        })
+        local ok, err = store:flush()
+        T.eq(ok, false)
+        T.ok(err, "应带回编码错误")
+    end)
+
+    T.test("newJsonStore 写入失败时返回 false, err", function()
+        local store = Store.newJsonStore({
+            path = "/virtual/w.json",
+            readfile = function() return nil end,
+            writefile = function() return nil, "disk full" end,
+            encode = function(t) return json.encode(t) end,
+        })
+        local ok, err = store:flush()
+        T.eq(ok, false)
+        T.eq(err, "disk full")
+    end)
+
+    T.test("newJsonStore 落盘后重新读取得到同样内容", function()
+        local files = {}
+        local store = memJsonStore({ files = files })
+        store:setData({ version = 1, servers = { sid = { { dir = "books", used = 100, count = 2 } } } })
+        T.eq(store:flush(), true)
+
+        local store2 = memJsonStore({ files = files })
+        T.eq(store2:load(), true)
+        local data = store2:getData()
+        T.eq(data.version, 1)
+        T.eq(data.servers.sid[1].dir, "books")
+        T.eq(data.servers.sid[1].count, 2)
+    end)
+
+    T.test("newJsonStore 不影响 ProgressStore 行为", function()
+        -- 两个 store 类型互相独立：ProgressStore 仍然固定为 {version, files}
+        T.is_table(Store.ProgressStore, "ProgressStore 仍导出")
+        T.is_table(Store.JsonStore, "JsonStore 已导出")
+        -- ProgressStore 的既有用法（带 path + codec）不受新代码影响
+        local ps, _, _ = memStore()
+        T.is_table(ps, "newProgressStore 仍可用")
+        T.eq(#ps:list(), 0, "空进度仍是空列表")
+        ps:set("sid/a.txt", { percent = 0.5 })
+        T.near(ps:get("sid/a.txt").percent, 0.5, nil, "进度读写行为不变")
+        T.eq(ps:flush(), true)
+    end)
+
     return M
 end
 

@@ -4,13 +4,26 @@
 
 界面结构（继承 BookList / Menu）：
   ┌──────────────────────────────┐
-  │ 服务器名            当前路径  │  <- 标题栏
+  │ 服务器名      当前路径 · 排序 │  <- 标题栏（副标题带当前排序方式）
   ├──────────────────────────────┤
   │ 📁 子目录/          [3 项]   │  <- 点击进入
   │ 📄 三体.txt         42%  2MB │  <- 点击：下载到临时目录并打开阅读
   │ ...                          │     长按：删除 / 移动 / 重命名 / 详情
   └──────────────────────────────┘
-  左按钮：上一级 / 菜单      右按钮：刷新
+  左按钮：目录菜单（上一级 / 刷新 / 排序 / 新建文件夹 / 切换服务器 / 缓存设置）
+          长按左按钮：直接返回上一级
+
+排序：
+  * 目录页面左上角菜单里的「排序」可切换 名称 / 名称（自然）/ 修改时间 /
+    创建时间 / 大小 / 类型，并可切换 升序 / 降序 与「目录优先」；
+  * 选择会写进插件状态（webdavreader_state.lua），下次进入沿用上次的选择；
+  * 目录之间始终按名称排序，日期/大小只作用于文件；
+  * 按时间排序时，列表右侧会顺带显示对应日期，便于核对。
+
+移动历史：
+  * 「移动」先弹出最近用过的目标目录，点一下即可移动；
+  * 目标目录记在 webdavreader_history.json，按服务器隔离，最多 20 条（界面显示 8 条）；
+  * 只有在移动**成功**后才记入历史；「其他位置…」仍可手动输入任意目录。
 
 与官方 cloudstorage 插件的区别（本插件的核心设计）：
   * 不需要用户指定本地下载目录：远程文件直接下载到插件自己的临时缓存，
@@ -41,6 +54,8 @@ local util = require("util")
 local _ = require("gettext")
 local T = ffiUtil.template
 
+local History = require("wdr.history")
+local Sort = require("wdr.sort")
 local Store = require("wdr.store")
 
 local Browser = BookList:extend{
@@ -51,7 +66,14 @@ local Browser = BookList:extend{
     cache = nil,
     manager = nil,
 
-    collate = "strcoll",
+    -- 排序状态。由 main.lua 从插件状态里恢复；排序变化时回写。
+    --   sort_key        见 wdr/sort.lua 的 Sort.keys
+    --   sort_descending 用户看到的方向（true=降序）；与各键自身默认方向无关
+    --   sort_folders_first 目录是否始终排在文件前面
+    sort_key = Sort.DEFAULT_KEY,
+    sort_descending = false,
+    sort_folders_first = true,
+
     path = "",           -- 当前远程路径（相对，无前导斜杠）
     server_idx = nil,
     paths = nil,         -- 已访问路径栈，用于返回上级
@@ -61,36 +83,10 @@ local Browser = BookList:extend{
     -- 进入目录后回到原位置
     item_idx_stack = nil,
     show_progress = true,
+    -- 移动对话框里最多列出多少条历史目标（存储层最多保留 20 条）
+    MOVE_HISTORY_LIMIT = 8,
 }
 
-local collates = {
-    strcoll = {
-        text = _("name"),
-        sort_func = BookList.getCollateSortFunc(),
-    },
-    name = {
-        text = _("name (natural)"),
-        sort_func = BookList.getCollateSortFunc("natural"),
-    },
-    size = {
-        text = _("size"),
-        sort_func = function(a, b)
-            if a.is_file and b.is_file then
-                return (a.filesize or 0) < (b.filesize or 0)
-            end
-            return ffiUtil.strcoll(a.text, b.text)
-        end,
-    },
-    date = {
-        text = _("date modified"),
-        sort_func = function(a, b)
-            if a.is_file and b.is_file and a.modification and b.modification then
-                return a.modification > b.modification
-            end
-            return ffiUtil.strcoll(a.text, b.text)
-        end,
-    },
-}
 
 --------------------------------------------------------------------------------
 -- 生命周期
@@ -115,6 +111,36 @@ function Browser:init()
     -- 必须放在 BookList.init 之后：Menu.init 会无条件把 self.paths 重置为 {}，
     -- 那是 Menu 自己用来追踪导航的表。我们用独立的 dir_stack，避免被覆盖。
     self.dir_stack = self.dir_stack or { "" }
+
+    -- 让 Menu 的「返回上一级」箭头（左下角）可用。
+    --
+    -- 为什么需要这一句：Menu:updatePageInfo 里有一行
+    --     self.page_return_arrow:enableDisable(#self.paths > 0)
+    -- 即箭头是否可点，完全由 Menu 自己的 self.paths 决定。而本插件从来不用 self.paths
+    -- 做导航（Menu:init 会把它重置为 {}，我们用独立的 dir_stack），所以它永远是空表，
+    -- 于是箭头虽然显示出来，却永远处于 disabled 状态 —— 点下去毫无反应。
+    --
+    -- dir_stack 与 paths 在这里恰好语义一致（都表示「可以往上走」），所以让 paths
+    -- 跟随 dir_stack 即可，不必改动 Menu。KOReader 官方 filemanagercollection.lua:109
+    -- 用的也是同一手法（table.insert(self.booklist_menu.paths, true)）。
+    self:syncMenuPaths()
+end
+
+--- 把 dir_stack 的「可返回性」同步给 Menu 的 self.paths，用于启用左下角返回箭头。
+--
+-- 只在两种状态间取值：根目录（栈深 1）→ 空表，可返回 → 单元素表。
+-- 不直接把 dir_stack 赋给 paths：Menu 会在 updatePageInfo 里读 #self.paths，
+-- 只需要「有没有」这个布尔信息，复用一个短表既够用又不会让 Menu 的内部状态变复杂。
+function Browser:syncMenuPaths()
+    local can_go_up = self.dir_stack and #self.dir_stack > 1
+    if can_go_up then
+        if #self.paths == 0 then
+            self.paths[1] = true
+        end
+    elseif #self.paths > 0 then
+        -- 从子目录回到根目录后要重新禁用箭头，不能只 insert 不清理
+        self.paths = {}
+    end
 end
 
 --- 由 main.lua 调用：打开指定服务器的起始目录。
@@ -124,7 +150,44 @@ function Browser:openServer(server_idx)
     local server = self.config:getServer(server_idx)
     if not server then return end
     local start = Store.normalizeDir(server.start_dir)
-    self:enterPath(start, true)
+    self:openPathAt(start, true)
+end
+
+--- 直接跳到某个深层目录，并按路径段数重建导航栈。
+--
+-- 为什么必须有这个函数：直接调用 enterPath(path) 只会改变 self.path，
+-- 而 dir_stack 仍是 { "" }。于是「返回上一级」的所有判据（#dir_stack > 1）全为假：
+--   * buildItemTable 不插入「⬆ ../」置顶行；
+--   * syncMenuPaths 让左下角箭头保持 disabled；
+--   * 目录菜单里的「上一级」是灰的；
+--   * onReturn 还会走进 onClose() 分支 —— 在深层目录里按返回等于直接关掉界面。
+-- 典型触发点就是「记住上次浏览位置」：用户上次在 books/deep，重开却一条退路都没有。
+--
+-- 修复方式：把目标路径按 "/" 拆段，逐级压栈（根是 ""，所以 N 段目录对应 N+1 个元素），
+-- 这样 dir_stack 与 self.path 始终自洽。
+-- @param path string 相对路径（"" 表示根目录）
+-- @param do_show boolean|nil 是否显示界面
+function Browser:openPathAt(path, do_show)
+    path = Store.normalizeDir(path)
+    self:rebuildDirStack(path)
+    self:enterPath(path, do_show)
+end
+
+--- 按路径的层级重建 dir_stack（根 "" + 每一段目录）。
+-- 单独抽出来是因为「进入失败后回退到起始目录」也要把栈对齐到实际路径，
+-- 不能让栈指向一个已经不存在的层级。
+-- @param path string 相对路径
+-- @return table 重建后的 dir_stack
+function Browser:rebuildDirStack(path)
+    path = Store.normalizeDir(path)
+    self.dir_stack = { "" }
+    if path == "" then return self.dir_stack end
+    local acc = ""
+    for seg in path:gmatch("[^/]+") do
+        acc = acc == "" and seg or (acc .. "/" .. seg)
+        self.dir_stack[#self.dir_stack + 1] = acc
+    end
+    return self.dir_stack
 end
 
 --------------------------------------------------------------------------------
@@ -172,15 +235,28 @@ function Browser:enterPath(path, do_show)
             local start = Store.normalizeDir(server.start_dir or "")
             if start ~= "" and start ~= path then table.insert(candidates, start) end
             if path ~= "" then table.insert(candidates, "") end
-            for _, candidate in ipairs(candidates) do
+            -- 循环变量不要用 "_"：本文件顶部有 local _ = require("gettext")，
+            -- 用 "_" 当占位变量会把它遮蔽成 ipairs 的索引（数字），
+            -- 于是分支里的 T(_("...")) 会抛 attempt to call local '_' (a number value)，
+            -- 表现为「首次进入某目录失败需要回退时整个界面崩掉」。
+            for candidate_idx, candidate in ipairs(candidates) do
                 local retry_items = client:list(candidate)
                 if retry_items then
                     self._fallback_tried = nil
                     self.path = candidate
+                    self.raw_items = retry_items
+                    -- 回退到的目录通常比原目标浅（起始目录或根），
+                    -- dir_stack 必须跟着这个新路径重建，否则「返回上一级」
+                    -- 会指向一个不存在的层级（甚至把栈弹空）。
+                    self:rebuildDirStack(candidate)
                     self:buildItemTable(retry_items, candidate)
-                    local subtitle = candidate == "" and "/" or "/" .. candidate
-                    self:switchItemTable(server.name or "WebDAV", self.item_table, nil, nil, subtitle)
+                    local retry_subtitle = self:getSubtitle()
+                    self.subtitle = retry_subtitle
+                    self:syncMenuPaths()
+                    self:switchItemTable(server.name or "WebDAV", self.item_table,
+                        nil, nil, retry_subtitle)
                     UIManager:show(self)
+                    self:setTitleBarLeftIcon("appbar.menu")
                     UIManager:show(InfoMessage:new{
                         text = T(_("无法打开请求的目录，已回到 /%1"),
                             candidate == "" and "" or candidate),
@@ -205,33 +281,86 @@ function Browser:enterPath(path, do_show)
     end
 
     self.path = path
+    self.raw_items = items
     self:buildItemTable(items, path)
 
     local title = server.name or _("WebDAV")
-    local subtitle = path == "" and "/" or "/" .. path
+    local subtitle = self:getSubtitle()
+    -- 自己留存一份副标题：Menu:switchItemTable 只把它交给 title_bar，
+    -- 不会回写 self.subtitle，留一份便于排序变更后重画（与断言）。
+    self.subtitle = subtitle
+    -- 必须在 switchItemTable 之前同步：它内部会调用 updateItems -> updatePageInfo，
+    -- 而那一步会读 #self.paths 决定左下角返回箭头是否可点。
+    self:syncMenuPaths()
+    self:switchItemTable(title, self.item_table, nil, nil, subtitle)
     if do_show then
-        self:switchItemTable(title, self.item_table, nil, nil, subtitle)
         UIManager:show(self)
     else
-        self:switchItemTable(title, self.item_table, nil, nil, subtitle)
         self:updateItems(1, true)
     end
-    -- 此处 title_bar 已由 Menu:init 创建，可以安全设置左侧图标
-    self:setTitleBarLeftIcon("plus")
+    -- 此处 title_bar 已由 Menu:init 创建，可以安全设置左侧图标。
+    -- 该按钮打开目录菜单（含排序），图标保持汉堡菜单样式，不要改成别的图形，
+    -- 否则用户会以为它是「新建」之类的操作。
+    self:setTitleBarLeftIcon("appbar.menu")
+end
+
+--- 标题栏副标题：当前路径 + 当前排序方式。
+-- 把排序状态放在这里，用户随时能看到「现在按什么排」，不必进菜单确认。
+function Browser:getSubtitle()
+    local path_text = self.path == "" and "/" or "/" .. self.path
+    return path_text .. "  ·  " .. self:getSortSummary()
+end
+
+--- 当前排序的简短说明，如 "名称 ↑"。
+function Browser:getSortSummary()
+    local arrow = self.sort_descending and "↓" or "↑"
+    return T(_("%1 %2"), Sort.getText(self.sort_key), arrow)
+end
+
+--- 组装传给 wdr/sort.lua 的排序参数。
+function Browser:getSortOptions()
+    return {
+        key = self.sort_key,
+        descending = self.sort_descending and true or false,
+        folders_first = self.sort_folders_first ~= false,
+    }
 end
 
 --- 把服务器返回的原始条目转成 Menu 的可显示项。
 function Browser:buildItemTable(items, path)
     local server = self.config:getServer(self.server_idx)
     local tbl = {}
+    local sort_key_info = Sort.KEY_BY_ID[self.sort_key] or Sort.KEY_BY_ID[Sort.DEFAULT_KEY]
+    local show_date = sort_key_info and sort_key_info.date_based
 
-    for _, it in ipairs(items or {}) do
+    -- 置顶一行「返回上一级」。
+    --
+    -- 为什么需要它：底部左下角的返回箭头依赖 Menu:updatePageInfo 里的
+    -- enableDisable(#self.paths > 0)，状态链路容易失效；而「怎么回到上一层」是
+    -- 浏览目录时最高频的操作，不该只藏在一个小箭头或长按里。
+    -- 用 KOReader 自己的 is_go_up 约定（filechooser.lua:266 的同款写法），
+    -- 排序时由 wdr/sort.lua 把 is_go_up 固定在最前，不受排序方式影响。
+    if self.dir_stack and #self.dir_stack > 1 then
+        table.insert(tbl, {
+            text = BD.mirroredUILayout() and BD.ltr("../ ⬆") or "⬆ ../",
+            is_go_up = true,
+            is_folder = false,
+            is_file = false,
+            name = "..",
+            remote_path = self.dir_stack[#self.dir_stack - 1] or "",
+        })
+    end
+
+    for item_idx, it in ipairs(items or {}) do
         if it.is_folder then
             table.insert(tbl, {
                 text = "📁 " .. it.name,
                 is_folder = true,
+                is_file = false,
                 remote_path = it.path or Store.joinRemotePath(path, it.name),
                 name = it.name,
+                modification = it.modified,
+                created = it.created,
             })
         else
             local entry = self.progress:get(server, it.path or Store.joinRemotePath(path, it.name))
@@ -240,6 +369,13 @@ function Browser:buildItemTable(items, path)
             local mandatory_parts = {}
             if progress_text then
                 table.insert(mandatory_parts, "★" .. progress_text)
+            end
+            -- 按时间排序时把对应日期显示出来，方便核对排序结果（否则用户只看到名字在跳）
+            if show_date then
+                local stamp = sort_key_info.key == "created" and it.created or it.modified
+                if stamp then
+                    table.insert(mandatory_parts, os.date("%Y-%m-%d", stamp))
+                end
             end
             if size_text ~= "" then
                 table.insert(mandatory_parts, size_text)
@@ -252,6 +388,7 @@ function Browser:buildItemTable(items, path)
                 name = it.name,
                 filesize = it.size,
                 modification = it.modified,
+                created = it.created,
                 progress_entry = entry,
                 progress_text = progress_text,
                 mandatory = table.concat(mandatory_parts, "  "),
@@ -264,23 +401,42 @@ function Browser:buildItemTable(items, path)
     return tbl
 end
 
+--- 按当前排序状态给菜单项排序（原地）。
+-- 具体比较规则见 wdr/sort.lua：目录优先、目录之间始终按名称、缺值项排最后。
 function Browser:sortItemTable(tbl)
-    local sort_func
-    local coll = collates[self.collate]
-    if coll then
-        sort_func = coll.sort_func
+    Sort.sortItems(tbl, self:getSortOptions())
+    return tbl
+end
+
+--- 排序状态改变后重画列表。
+-- 用缓存的原始条目重建，而不是重新请求服务器：切排序不该产生网络开销。
+function Browser:applySort()
+    if self.raw_items then
+        self:buildItemTable(self.raw_items, self.path)
     else
-        sort_func = collates.strcoll.sort_func
+        self:sortItemTable(self.item_table)
     end
-    table.sort(tbl, function(a, b)
-        if a.is_folder ~= b.is_folder then
-            return a.is_folder -- 目录优先
-        end
-        if a.is_file and b.is_file then
-            return sort_func(a, b)
-        end
-        return ffiUtil.strcoll(a.name or a.text, b.name or b.text)
-    end)
+    self:refreshTitleSubtitle()
+    if self.item_table then
+        self:updateItems(1, true)
+    end
+end
+
+--- 只更新标题栏副标题（路径没变、只是排序变了）。
+function Browser:refreshTitleSubtitle()
+    local subtitle = self:getSubtitle()
+    self.subtitle = subtitle
+    if self.title_bar and self.title_bar.setSubTitle then
+        pcall(function() self.title_bar:setSubTitle(subtitle) end)
+    end
+end
+
+--- 排序状态变化时回调插件，由 main.lua 写进插件状态文件。
+-- 用回调而不是让 browser 直接碰持久化，保持界面层与存储层解耦。
+function Browser:notifySortChanged()
+    if type(self.on_sort_changed) == "function" then
+        pcall(self.on_sort_changed, self.sort_key, self.sort_descending, self.sort_folders_first)
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -288,7 +444,10 @@ end
 --------------------------------------------------------------------------------
 
 function Browser:onMenuSelect(item)
-    if item.is_folder then
+    -- 置顶的「返回上一级」行
+    if item.is_go_up then
+        self:onReturn()
+    elseif item.is_folder then
         self.dir_stack[#self.dir_stack + 1] = item.remote_path
         self:enterPath(item.remote_path)
     elseif item.is_file then
@@ -382,6 +541,11 @@ end
 --------------------------------------------------------------------------------
 
 function Browser:onMenuHold(item)
+    -- 「返回上一级」行没有可管理的内容（不能重命名/删除/移动它），
+    -- 长按不弹菜单，避免出现一批对着它毫无意义的按钮。
+    if item.is_go_up then
+        return true
+    end
     self.file_dialog = ButtonDialog:new{
         title = item.is_folder and (item.name .. "/") or item.name,
         title_align = "center",
@@ -495,6 +659,10 @@ function Browser:showFileInfo(item)
     if item.modification then
         table.insert(lines, T(_("修改时间：%1"),
             os.date("%Y-%m-%d %H:%M", item.modification)))
+    end
+    if item.created then
+        table.insert(lines, T(_("创建时间：%1"),
+            os.date("%Y-%m-%d %H:%M", item.created)))
     end
     if entry then
         if entry.percent then
@@ -650,8 +818,72 @@ function Browser:doRename(item, new_name)
     self:enterPath(self.path)
 end
 
---- 移动对话框：输入目标目录的相对路径（相对服务器根）。
+--- 移动对话框：优先给出「最近用过的目标目录」，点一下即可移动。
+--
+-- 为什么不直接用输入框：移动时目标目录通常是最近用过的少数几个，
+-- 手输一长串相对路径既慢又容易打错（打错还会得到「目标已存在」之类的报错）。
+-- 因此这里先列历史，最后一个按钮仍是「其他位置…」进入手输，保留完整自由度。
 function Browser:showMoveDialog(item)
+    local server = self.config:getServer(self.server_idx)
+    local current_dir = Store.getRemoteDir(item.remote_path)
+
+    local entries = {}
+    if server then
+        local ok, list = pcall(History.list, History, server, self.MOVE_HISTORY_LIMIT or 8)
+        if ok and type(list) == "table" then entries = list end
+    end
+
+    local buttons = {}
+    for entry_idx, entry in ipairs(entries) do
+        -- 当前所在目录不必列出：移到自己所在目录等于没动
+        if entry.dir ~= current_dir then
+            table.insert(buttons, {
+                {
+                    text = History.formatLabel(entry),
+                    align = "left",
+                    callback = function()
+                        UIManager:close(self.move_dialog)
+                        self:doMove(item, entry.dir)
+                    end,
+                },
+            })
+        end
+    end
+
+    if #buttons == 0 then
+        -- 没有历史（或历史里只剩当前目录）时提示一句，免得用户以为按钮没加载。
+        -- 不挂 callback：KOReader 的 Button 在 enabled=false 时不会触发点击
+        -- （button.lua 的 onTapSelectButton 先判 enabled），只作为灰条提示用，
+        -- 与官方（如 filemanagerbookinfo 的占位按钮）写法一致。
+        table.insert(buttons, {
+            {
+                text = _("（暂无历史位置）"),
+                enabled = false,
+            },
+        })
+    end
+
+    table.insert(buttons, {})
+    table.insert(buttons, {
+        {
+            text = _("其他位置…"),
+            callback = function()
+                UIManager:close(self.move_dialog)
+                self:showMoveInputDialog(item)
+            end,
+        },
+    })
+
+    self.move_dialog = ButtonDialog:new{
+        title = T(_("移动到：%1"), item.name),
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(self.move_dialog)
+end
+
+--- 手输目标目录的对话框（历史之外的兜底路径）。
+function Browser:showMoveInputDialog(item)
     local dialog
     local hint = _("目标目录（相对服务器根，留空表示根目录）")
     dialog = InputDialog:new{
@@ -688,6 +920,10 @@ function Browser:doMove(item, target_dir)
     target_dir = Store.normalizeDir(util.trim(target_dir or ""))
     local new_path = Store.joinRemotePath(target_dir, item.name)
     if new_path == item.remote_path then
+        UIManager:show(Notification:new{
+            text = _("已经在该目录里了"),
+            timeout = 2,
+        })
         return
     end
     local ok, err = self.manager:moveItem(server, item.remote_path, new_path)
@@ -697,6 +933,11 @@ function Browser:doMove(item, target_dir)
             timeout = 4,
         })
         return
+    end
+    -- 只有移动成功才记历史：否则用户点一个过期/无权限的目标后，
+    -- 那个错误目标会一直排在快捷列表最前面，反而更难用。
+    if server then
+        pcall(History.add, History, server, target_dir)
     end
     UIManager:show(Notification:new{
         text = T(_("已移动到 /%1"), new_path),
@@ -740,10 +981,26 @@ function Browser:showFolderMenu()
         {},
         {
             {
-                text = T(_("排序：%1"), (collates[self.collate] or collates.strcoll).text),
+                text = T(_("排序：%1"), self:getSortSummary()),
                 callback = function()
                     UIManager:close(self.folder_menu)
                     self:showSortDialog()
+                end,
+            },
+        },
+        {
+            {
+                text = self.sort_folders_first ~= false and _("目录优先：开") or _("目录优先：关"),
+                callback = function()
+                    UIManager:close(self.folder_menu)
+                    self:setSort(self.sort_key, self.sort_descending, self.sort_folders_first == false)
+                end,
+            },
+            {
+                text = self.sort_descending and _("方向：降序") or _("方向：升序"),
+                callback = function()
+                    UIManager:close(self.folder_menu)
+                    self:setSort(self.sort_key, not self.sort_descending, self.sort_folders_first)
                 end,
             },
         },
@@ -766,27 +1023,78 @@ function Browser:showFolderMenu()
             },
         },
     }
-    self.folder_menu = ButtonDialog:new{ buttons = buttons }
+    self.folder_menu = ButtonDialog:new{
+        title = self.path == "" and "/" or "/" .. self.path,
+        title_align = "center",
+        buttons = buttons,
+    }
     UIManager:show(self.folder_menu)
 end
 
+--- 切换排序状态：重建列表、刷新标题、并通知插件持久化。
+-- @param key string 排序键（非法值由 Sort.resolve 兜底）
+-- @param descending boolean|nil 方向（true=降序）
+-- @param folders_first boolean|nil 目录是否优先
+function Browser:setSort(key, descending, folders_first)
+    local resolved = Sort.resolve(key)
+    local changed = (resolved ~= self.sort_key)
+        or ((descending and true or false) ~= (self.sort_descending and true or false))
+        or ((folders_first ~= false) ~= (self.sort_folders_first ~= false))
+    self.sort_key = resolved
+    self.sort_descending = descending and true or false
+    self.sort_folders_first = folders_first ~= false
+    self:applySort()
+    if changed then
+        self:notifySortChanged()
+    end
+end
+
+--- 排序方式选择对话框。
+--
+-- 交互设计（两点刻意的取舍）：
+--   * 当前键前打 ✓，并且只有当前键显示「真实方向」箭头，其余键显示「选中后会变成的方向」，
+--     这样用户点之前就知道点完会得到什么顺序；
+--   * 再点一次当前键 = 翻转方向。排序键只有 6 个、方向只有 2 个，把「换键」和
+--     「换方向」都塞进同一个列表，比再开一层子菜单少一次点击。
 function Browser:showSortDialog()
     local buttons = {}
-    for key, coll in pairs(collates) do
+    for info_idx, info in ipairs(Sort.keys) do
+        local is_current = (info.key == self.sort_key)
+        local direction = is_current
+            and (self.sort_descending and "↓" or "↑")
+            or (info.descending and "↓" or "↑")
         table.insert(buttons, {
             {
-                text = (self.collate == key and "✓ " or "") .. coll.text,
+                text = (is_current and "✓ " or "") .. Sort.getText(info.key) .. " " .. direction,
                 callback = function()
                     UIManager:close(self.sort_dialog)
-                    self.collate = key
-                    self:sortItemTable(self.item_table)
-                    self:updateItems(1, true)
+                    if is_current then
+                        -- 再次点当前项 = 切换方向，省一次点击
+                        self:setSort(info.key, not self.sort_descending, self.sort_folders_first)
+                    else
+                        self:setSort(info.key, info.descending and true or false, self.sort_folders_first)
+                    end
                 end,
             },
         })
     end
-    table.sort(buttons, function(a, b) return a[1].text < b[1].text end)
-    self.sort_dialog = ButtonDialog:new{ title = _("排序方式"), buttons = buttons }
+    -- 单独给出「目录优先」开关，避免只能靠记忆判断目录是否混排
+    table.insert(buttons, {})
+    table.insert(buttons, {
+        {
+            text = self.sort_folders_first ~= false and _("✓ 目录优先：开") or _("目录优先：关"),
+            callback = function()
+                UIManager:close(self.sort_dialog)
+                self:setSort(self.sort_key, self.sort_descending, self.sort_folders_first == false)
+            end,
+        },
+    })
+
+    self.sort_dialog = ButtonDialog:new{
+        title = _("排序方式"),
+        title_align = "center",
+        buttons = buttons,
+    }
     UIManager:show(self.sort_dialog)
 end
 
@@ -839,6 +1147,10 @@ end
 -- 导航
 --------------------------------------------------------------------------------
 
+--- 返回上一级。
+-- 栈已到根（#dir_stack == 1）时，这个动作的语义其实是「关掉浏览界面」，
+-- 而不是「什么都不做」——之前的实现会让左下角箭头在根目录下点了毫无反馈，
+-- 用户只会以为按钮坏了。这里改成关闭界面，与 KOReader 里「返回即退出」的直觉一致。
 function Browser:onReturn()
     if #self.dir_stack > 1 then
         table.remove(self.dir_stack)

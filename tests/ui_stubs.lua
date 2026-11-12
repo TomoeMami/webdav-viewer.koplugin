@@ -43,6 +43,16 @@ function UIManagerStub.reset()
     UIManagerStub.scheduled = {}
 end
 
+--- 记录一次「关闭控件」，与真实 UIManager:close 的可观察效果对齐。
+-- Menu:onClose 会调用 UIManagerStub:close(self)；此前这个桩件方法根本不存在，
+-- 所以「在根目录按返回 → 关闭界面」这条路径一走到就抛
+-- attempt to call method 'close' (a nil value)，无法断言。
+-- 只做记录，不改变任何被测逻辑。
+function UIManagerStub:close(widget)
+    table.insert(UIManagerStub.closed, widget)
+    return true
+end
+
 --- 收集一个假控件里所有可显示的文本（用于断言文案）。
 function UIManagerStub.collect_texts(widget)
     local out = {}
@@ -62,6 +72,17 @@ function UIManagerStub.collect_texts(widget)
     end
     walk(widget, 1)
     return out
+end
+
+--- 在控件里查找某段文字（collect_texts 的便捷封装，供 contains 类断言使用）。
+-- @param widget table 假控件
+-- @param needle string 要查找的子串
+-- @return boolean 是否找到
+function UIManagerStub.find_text(widget, needle)
+    for _, t in ipairs(UIManagerStub.collect_texts(widget)) do
+        if t:find(needle, 1, true) then return true end
+    end
+    return false
 end
 
 -- 记录菜单注册
@@ -105,6 +126,10 @@ function EventListener:handleEvent(event)
 end
 
 local Widget = EventListener:extend{}
+
+-- 前向声明：Menu:init 要用它做 title_bar 的元表，
+-- 若等下面再 local 声明，这里会解析成全局 nil（setmetatable(t, nil) 合法但静默失去方法）。
+local TitleBarStub
 
 -- Menu 基类：只实现被测代码实际调用的方法
 local Menu = Widget:extend{
@@ -167,7 +192,7 @@ function Menu:onMenuHold(item)
 end
 
 -- title_bar 的桩：同时记录以便断言
-local TitleBarStub = {}
+TitleBarStub = {}
 TitleBarStub.__index = TitleBarStub
 function TitleBarStub:setLeftIcon(icon)
     if self.has_left_icon then
@@ -362,6 +387,8 @@ function FakePlugin:openRemoteFile(server, item, local_path)
 end
 
 --- 供 browser 用的 manager 替身。
+-- overrides 里可以传：
+--   fail_move = true   让 moveItem 返回 false, "move failed"（验证「移动失败不写历史」）
 FakeManager = {}
 FakeManager.__index = FakeManager
 
@@ -370,6 +397,7 @@ function FakeManager.new(overrides)
         deleted = {},
         moved = {},
         created = {},
+        fail_move = false,
     }
     for k, v in pairs(overrides or {}) do base[k] = v end
     return setmetatable(base, FakeManager)
@@ -391,6 +419,9 @@ end
 
 function FakeManager:moveItem(server, from, to)
     table.insert(self.moved, { from, to })
+    if self.fail_move then
+        return false, "move failed"
+    end
     return true
 end
 
@@ -523,6 +554,14 @@ function UIStubs.install()
         function BD.filepath(p) return p end
         function BD.filename(p) return p end
         function BD.wrap(s) return s end
+        -- 真实 KOReader 里这两个函数是 browser.lua 构造「返回上一级」行时用到的
+        -- （ui/bidi.lua:126 mirroredUILayout / :199 ltr）。桩件缺了它们，一旦用例
+        -- 走到 dir_stack 深度 > 1 的分支就会抛 attempt to call a nil value。
+        BD._mirrored = false
+        function BD.mirroredUILayout() return BD._mirrored end
+        function BD.ltr(text) return text end
+        function BD.rtl(text) return text end
+        function BD.rtlUIText() return false end
         return BD
     end
 

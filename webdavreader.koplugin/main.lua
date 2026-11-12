@@ -35,9 +35,11 @@ local T = ffiUtil.template
 
 local Cache = require("wdr.cache")
 local Config = require("wdr.config")
+local History = require("wdr.history")
 local Manager = require("wdr.manager")
 local Progress = require("wdr.progress")
 local Session = require("wdr.session")
+local Sort = require("wdr.sort")
 local Store = require("wdr.store")
 local WebDAV = require("wdr.webdav")
 
@@ -60,6 +62,7 @@ function WebDavReader:init()
 
     Config:load()
     Progress:init()
+    History:init()
     Cache:setDir(Config:getCacheDir())
     Manager:setup{
         config = Config,
@@ -118,6 +121,12 @@ function WebDavReader:addToMainMenu(menu_items)
                 text = _("阅读进度记录"),
                 callback = function()
                     self:showProgressList()
+                end,
+            },
+            {
+                text = _("移动位置记录"),
+                callback = function()
+                    self:showMoveHistory()
                 end,
             },
         },
@@ -183,6 +192,11 @@ function WebDavReader:openBrowserFor(server_idx)
     local server = Config:getServer(server_idx)
     if not server then return end
 
+    -- 恢复上次的排序偏好（非法/缺失值由 Sort.resolve 兜底成默认值）
+    local saved_key = self:readSetting("sort_key")
+    local saved_descending = self:readSetting("sort_descending")
+    local saved_folders_first = self:readSetting("sort_folders_first")
+
     -- 注意：Widget 的 new() 会自动调用 init()，这里不要再手动调一次，
     -- 否则会把 paths 栈和 server_idx 重置掉。
     local browser = Browser:new{
@@ -191,8 +205,18 @@ function WebDavReader:openBrowserFor(server_idx)
         progress = Progress,
         cache = Cache,
         manager = Manager,
-        collate = self:readSetting("collate") or "strcoll",
         server_idx = server_idx,
+        -- 左侧按钮必须在这里声明：Menu:init 用 title_bar_left_icon 判断是否创建左按钮，
+        -- 而 Browser:init 里不能调 setTitleBarLeftIcon（那时 title_bar 还没建）。
+        -- 少了这一项，左上角按钮根本不会出现，目录菜单（含排序设置）就无从打开。
+        title_bar_left_icon = "appbar.menu",
+        sort_key = Sort.resolve(saved_key),
+        sort_descending = saved_descending == true,
+        sort_folders_first = saved_folders_first ~= false,
+        -- 排序变化时回写插件状态，下次进浏览界面沿用
+        on_sort_changed = function(key, descending, folders_first)
+            self:saveSortSettings(key, descending, folders_first)
+        end,
     }
     self.browser = browser
     Session.last_server_idx = server_idx
@@ -201,7 +225,19 @@ function WebDavReader:openBrowserFor(server_idx)
     local start = Store.normalizeDir(server.start_dir or "")
     if target == "" then target = start end
 
-    browser:enterPath(target, true)
+    -- 用 openPathAt 而不是 enterPath：恢复出来的可能是深层目录，
+    -- 必须让 browser 的 dir_stack 与这个路径自洽，否则「返回上一级」三条退路
+    -- （置顶 ⬆ ../、左下角箭头、目录菜单「上一级」）全部失效。
+    browser:openPathAt(target, true)
+end
+
+--- 把排序偏好写进插件状态（状态量极小，立即落盘）。
+function WebDavReader:saveSortSettings(key, descending, folders_first)
+    local data = self:readState() or {}
+    data.sort_key = Sort.resolve(key)
+    data.sort_descending = descending and true or false
+    data.sort_folders_first = folders_first ~= false
+    self:writeState(data)
 end
 
 function WebDavReader:showServerList(for_browse)
@@ -608,7 +644,7 @@ function WebDavReader:showProgressList()
 
     local buttons = {}
     local shown = 0
-    for _, e in ipairs(entries) do
+    for entry_idx, e in ipairs(entries) do
         if shown >= 30 then break end
         local label = e.entry.remote_path or e.key
         local pct = Progress.formatEntry(e.entry)
@@ -643,7 +679,9 @@ function WebDavReader:showProgressList()
                     text = _("删除所有阅读进度记录？") .. "\n\n" .. _("远程文件与缓存不受影响。"),
                     ok_text = _("删除"),
                     ok_callback = function()
-                        for _, s in ipairs(Config:getServers()) do
+                        -- 不用 "_" 当占位变量：本文件顶部 local _ = require("gettext")，
+                        -- 用 "_" 会在循环内遮蔽它，之后在这个作用域里写 _(...) 都会崩。
+                        for srv_idx, s in ipairs(Config:getServers()) do
                             Progress:removeServer(s)
                         end
                         Progress:flush()
@@ -660,6 +698,94 @@ function WebDavReader:showProgressList()
         buttons = buttons,
     }
     UIManager:show(self.progress_dialog)
+end
+
+--------------------------------------------------------------------------------
+-- 移动位置历史
+--------------------------------------------------------------------------------
+
+--- 查看/清理「移动」用过的目标目录。
+-- 浏览界面里的「移动」会自动带上最近的历史，这个入口用于集中查看与清理。
+function WebDavReader:showMoveHistory()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local ConfirmBox = require("ui/widget/confirmbox")
+
+    -- 按服务器分组列出：不同服务器上的同名目录不能互相混用
+    local buttons = {}
+    local total = 0
+    for server_idx, server in ipairs(Config:getServers()) do
+        local entries = History:list(server)
+        if #entries > 0 then
+            -- 服务器名当分组标题：不可点，所以不挂 callback
+            -- （Button 在 enabled=false 时不会触发点击，官方占位按钮也是这么写的）
+            table.insert(buttons, {
+                {
+                    text = server.name ~= "" and server.name or server.address,
+                    enabled = false,
+                },
+            })
+            for entry_idx, entry in ipairs(entries) do
+                table.insert(buttons, {
+                    {
+                        text = History.formatLabel(entry),
+                        align = "left",
+                        callback = function()
+                            UIManager:close(self.move_history_dialog)
+                            UIManager:show(ConfirmBox:new{
+                                text = T(_("从历史中移除 %1？"),
+                                    History.formatDir(server, entry.dir)) .. "\n\n" ..
+                                        _("只是忘掉这个快捷位置，不会删除服务器上的任何文件。"),
+                                ok_text = _("移除"),
+                                ok_callback = function()
+                                    History:remove(server, entry.dir)
+                                    UIManager:show(Notification:new{
+                                        text = _("已移除"),
+                                        timeout = 2,
+                                    })
+                                end,
+                            })
+                        end,
+                    },
+                })
+                total = total + 1
+            end
+            table.insert(buttons, {})
+        end
+    end
+
+    if total == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("还没有移动记录。") .. "\n\n" ..
+                _("在浏览界面长按文件或目录 → 移动，成功移动后这里会记住目标位置。"),
+            timeout = 3,
+        })
+        return
+    end
+
+    table.insert(buttons, {
+        {
+            text = _("清空全部移动记录"),
+            callback = function()
+                UIManager:close(self.move_history_dialog)
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("清空 %1 条移动位置记录？"), total) .. "\n\n" ..
+                        _("只是忘掉快捷位置，不会删除服务器上的任何文件。"),
+                    ok_text = _("清空"),
+                    ok_callback = function()
+                        History:clear(nil)
+                        UIManager:show(Notification:new{ text = _("已清空"), timeout = 2 })
+                    end,
+                })
+            end,
+        },
+    })
+
+    self.move_history_dialog = ButtonDialog:new{
+        title = T(_("移动位置记录（%1 条）"), total),
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(self.move_history_dialog)
 end
 
 --------------------------------------------------------------------------------
@@ -709,7 +835,7 @@ function WebDavReader:resolveRemoteFor(doc_file)
 
     -- 按地址找服务器（不用索引：服务器列表可能已经增删过）
     local server
-    for _, srv in ipairs(Config:getServers()) do
+    for srv_idx, srv in ipairs(Config:getServers()) do
         if srv.address == info.server_address then
             server = srv
             break
@@ -945,7 +1071,7 @@ local function serializeValue(v)
         local keys = {}
         for k in pairs(v) do table.insert(keys, k) end
         table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-        for _, k in ipairs(keys) do
+        for key_idx, k in ipairs(keys) do
             table.insert(parts, string.format("[%q] = %s,", tostring(k), serializeValue(v[k])))
         end
         table.insert(parts, "}")
@@ -959,7 +1085,7 @@ function WebDavReader:writeState(data)
     local keys = {}
     for k in pairs(data) do table.insert(keys, k) end
     table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-    for _, k in ipairs(keys) do
+    for key_idx, k in ipairs(keys) do
         table.insert(parts, string.format("[%q] = %s,", k, serializeValue(data[k])))
     end
     table.insert(parts, "}")
@@ -978,12 +1104,25 @@ function WebDavReader:loadState()
     Session.loadMap(data.local_map)
 end
 
+--- 把会话状态合并进状态文件（读-改-写，而不是整表覆盖）。
+--
+-- 这里必须做合并：同一个 webdavreader_state.lua 里还存着排序偏好
+-- （sort_key / sort_descending / sort_folders_first）。早先的实现直接
+-- writeState{ last_server_idx=..., last_paths=..., local_map=... } 整表覆盖，
+-- 于是「打开一本书」这个动作（openRemoteFile 会调 saveState）顺手把用户的
+-- 排序设置抹掉了 —— 表现为「切完排序、一读书就变回默认」。
 function WebDavReader:saveState()
-    self:writeState({
-        last_server_idx = Session.last_server_idx,
-        last_paths = Session.last_paths,
-        local_map = Session.exportMap(),
-    })
+    local data = self:readState() or {}
+    -- 只在内存里有值时覆盖：把 nil 赋给 table 的键等于删除该键，
+    -- 若某条调用路径上 Session 还没初始化，就会顺手抹掉磁盘里已有的值。
+    if Session.last_server_idx ~= nil then
+        data.last_server_idx = Session.last_server_idx
+    end
+    if Session.last_paths ~= nil then
+        data.last_paths = Session.last_paths
+    end
+    data.local_map = Session.exportMap()
+    self:writeState(data)
 end
 
 --------------------------------------------------------------------------------
@@ -993,6 +1132,7 @@ end
 function WebDavReader:onFlushSettings()
     Config:save()
     Progress:flush()
+    History:flush()
     self:saveState()
 end
 

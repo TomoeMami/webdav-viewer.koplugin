@@ -194,6 +194,37 @@ function M.run(T, root)
         T.eq(Config:getDefaultServerIndex(), nil)
     end)
 
+    -- ---------------- 移动位置历史路径（追加用例） ----------------
+
+    T.test("getHistoryPath 指向 webdavreader_history.json", function()
+        local p = Config:getHistoryPath()
+        T.contains(p, "webdavreader_history.json", "文件名固定")
+        T.not_contains(p, "webdavreader_progress.json", "与进度文件区分")
+        T.neq(p, Config:getProgressPath(), "不能和进度同路径")
+    end)
+
+    T.test("getHistoryPath 与进度同目录（settings）", function()
+        local hp = Config:getHistoryPath()
+        local pp = Config:getProgressPath()
+        local hdir = hp:match("^(.*)/[^/]+$")
+        local pdir = pp:match("^(.*)/[^/]+$")
+        T.eq(hdir, pdir, "两者应在同一个 settings 目录")
+        T.eq(hdir, Config:getSettingsPath():match("^(.*)/[^/]+$"), "与配置文件同目录")
+    end)
+
+    T.test("getHistoryPath 是绝对路径且可重复求值", function()
+        local p1 = Config:getHistoryPath()
+        local p2 = Config:getHistoryPath()
+        T.eq(p1, p2, "同一次运行结果稳定")
+        T.ok(p1:match("^/") or p1:match("^%a:[/\\]"), "应是绝对路径")
+    end)
+
+    T.test("HISTORY_FILE 常量存在且与 getHistoryPath 一致", function()
+        T.eq(Config.HISTORY_FILE, "webdavreader_history.json")
+        T.contains(Config:getHistoryPath(), Config.HISTORY_FILE)
+        T.neq(Config.HISTORY_FILE, Config.PROGRESS_FILE, "与进度文件名不同")
+    end)
+
     return M
 end
 

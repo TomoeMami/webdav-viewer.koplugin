@@ -20,6 +20,7 @@ local Config = {
     updated = false,
     SETTINGS_FILE = "webdavreader.lua",
     PROGRESS_FILE = "webdavreader_progress.json",
+    HISTORY_FILE = "webdavreader_history.json",
     CACHE_DIRNAME = "webdavreader_cache",
     DEFAULT_MAX_CACHE_MB = 256,
 }
@@ -75,6 +76,11 @@ end
 --- 进度 JSON 路径。放在 settings 目录，便于用户备份。
 function Config:getProgressPath()
     return DataStorage:getSettingsDir() .. "/" .. self.PROGRESS_FILE
+end
+
+--- 移动位置历史 JSON 路径。与进度文件同目录（settings），便于用户一并备份。
+function Config:getHistoryPath()
+    return DataStorage:getSettingsDir() .. "/" .. self.HISTORY_FILE
 end
 
 function Config:load()

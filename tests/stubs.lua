@@ -75,10 +75,16 @@ function Stubs.install()
             end
             return table.concat(out, "/")
         end
+        -- 与 KOReader 真实实现保持一致：占位符是 "%1".."%99"（不是 "$1"）。
+        -- 之前这里写成 "$N"，导致所有 T(_("...%1...")) 在桌面测试里都不会被替换，
+        -- 于是「模板参数传错/漏传」这类 bug 在单测里永远暴露不出来。
+        -- 参考 frontend/ffi/util.lua 的 util.template。
         function M.template(str, ...)
-            local args = { ... }
-            return (str:gsub("^%$(%d+)$", function(d) return tostring(args[tonumber(d)] or "") end)
-                       :gsub("%$(%d+)", function(d) return tostring(args[tonumber(d)] or "") end))
+            local params = { n = select("#", ...), ... }
+            if params.n == 0 then return str end
+            return (str:gsub("%%([1-9][0-9]?)", function(i)
+                return tostring(params[tonumber(i)] or "")
+            end))
         end
         function M.strcoll(a, b) return a < b end
         function M.realpath(p) return p end

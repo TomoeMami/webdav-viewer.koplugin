@@ -1324,6 +1324,302 @@ test("gettext 若可用则被用于错误文案", function()
 end)
 
 -- ---------------------------------------------------------------------------
+-- 10. DAV:creationdate 解析（created 字段，供「创建时间」排序使用）
+-- ---------------------------------------------------------------------------
+
+-- Nextcloud / SabreDAV 都会在 creationdate 里给 RFC 3339（带 Z 或时区偏移），
+-- 但服务器也完全可能不返回它，或者返回一个非标准值 —— 两种情况都不能让解析崩，
+-- 也都**不允许**用 getlastmodified 冒充（created 缺失必须保持 nil，排序时才好在最后）。
+local CREATED_XML = [[<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+ <d:response>
+  <d:href>/dav/</d:href>
+  <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/dav/z.txt</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype/>
+    <d:getcontentlength>10</d:getcontentlength>
+    <d:creationdate>2024-11-12T09:30:15Z</d:creationdate>
+    <d:getlastmodified>Tue, 12 Nov 2024 10:00:00 GMT</d:getlastmodified>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/dav/y.txt</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype/>
+    <d:getcontentlength>20</d:getcontentlength>
+    <d:creationdate>2024-11-12T17:30:15+08:00</d:creationdate>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/dav/x.txt</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype/>
+    <d:getcontentlength>30</d:getcontentlength>
+    <d:getlastmodified>Tue, 12 Nov 2024 11:00:00 GMT</d:getlastmodified>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/dav/broken.txt</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype/>
+    <d:creationdate>不是时间</d:creationdate>
+    <d:getlastmodified>Tue, 12 Nov 2024 12:00:00 GMT</d:getlastmodified>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/dav/empty.txt</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype/>
+    <d:creationdate></d:creationdate>
+    <d:getlastmodified>Tue, 12 Nov 2024 13:00:00 GMT</d:getlastmodified>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/dav/sub/</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype><d:collection/></d:resourcetype>
+    <d:creationdate>2024-01-02T03:04:05Z</d:creationdate>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+</d:multistatus>]]
+
+test("parseMultiStatus：creationdate 带 Z 的 RFC3339 解析成 created", function()
+    local items, err = WebDAV.parseMultiStatus(CREATED_XML, {
+        address = "https://example.com/dav",
+        self_path = "",
+    })
+    eq(err, nil)
+    eq(#items, 6, "应有 6 个子项（目录自身被剔除）")
+    eq(items[1].name, "z.txt")
+    eq(items[1].created, 1731403815, "2024-11-12T09:30:15Z 应换算成 unix 秒")
+    eq(items[1].modified, 1731405600, "modified 与 created 各自独立解析")
+end)
+
+test("parseMultiStatus：creationdate 带 +08:00 偏移换算成 UTC", function()
+    local items = WebDAV.parseMultiStatus(CREATED_XML, {
+        address = "https://example.com/dav",
+        self_path = "",
+    })
+    local y = items[2]
+    eq(y.name, "y.txt")
+    eq(y.created, 1731403815, "17:30:15+08:00 与 09:30:15Z 是同一时刻")
+    eq(y.modified, nil, "该条目没有 getlastmodified，modified 应为 nil")
+end)
+
+test("parseMultiStatus：缺 creationdate 时 created 为 nil，不用 modified 冒充", function()
+    local items = WebDAV.parseMultiStatus(CREATED_XML, {
+        address = "https://example.com/dav",
+        self_path = "",
+    })
+    local x = items[3]
+    eq(x.name, "x.txt")
+    eq(x.created, nil, "服务器没给 creationdate 就不能编一个")
+    eq(x.modified, 1731409200, "modified 照常解析")
+end)
+
+test("parseMultiStatus：非法 / 空 creationdate 一律为 nil", function()
+    local items = WebDAV.parseMultiStatus(CREATED_XML, {
+        address = "https://example.com/dav",
+        self_path = "",
+    })
+    local broken = items[4]
+    eq(broken.name, "broken.txt")
+    eq(broken.created, nil, "非时间文本应解析为 nil 而不是崩溃")
+    eq(broken.modified, 1731412800, "同一条目的 modified 仍正常")
+
+    local empty = items[5]
+    eq(empty.name, "empty.txt")
+    eq(empty.created, nil, "空元素 creationdate 应为 nil")
+    eq(empty.modified, 1731416400)
+end)
+
+test("parseMultiStatus：目录条目也解析 created", function()
+    local items = WebDAV.parseMultiStatus(CREATED_XML, {
+        address = "https://example.com/dav",
+        self_path = "",
+    })
+    local sub = items[6]
+    eq(sub.name, "sub")
+    eq(sub.is_folder, true, "目录条目同样带 created")
+    ok(sub.created ~= nil, "目录应有 created")
+    eq(sub.created, 1704164645, "2024-01-02T03:04:05Z")
+end)
+
+test("parseMultiStatus：没有 creationdate 字段的旧响应.created 全为 nil", function()
+    -- NC_XML 是既有样本，一个 creationdate 都没有
+    local items, err = WebDAV.parseMultiStatus(NC_XML, {
+        address = "https://cloud.example.com/remote.php/dav/files/riko",
+        self_path = "书库",
+    })
+    eq(err, nil)
+    eq(#items, 2)
+    eq(items[1].created, nil, "缺失时必须是 nil")
+    eq(items[2].created, nil)
+    ok(items[1].modified ~= nil, "但 modified 不受影响")
+end)
+
+test("client:list 的 PROPFIND 请求体包含 creationdate", function()
+    FakeHttp.reset()
+    local sent = nil
+    FakeHttp.handler = function(req)
+        sent = drainSource(req.source) or ""
+        return respond(req, 207, { body = [[<d:multistatus xmlns:d="DAV:"></d:multistatus>]] })
+    end
+    local client = WebDAV.client(SERVER)
+    local items, err = client:list("")
+    eq(err, nil)
+    ok(items ~= nil)
+    ok(sent:find("creationdate", 1, true) ~= nil, "应请求 DAV:creationdate")
+    ok(sent:find("getlastmodified", 1, true) ~= nil, "原有的 getlastmodified 不能被挤掉")
+    ok(sent:find("resourcetype", 1, true) ~= nil)
+    ok(sent:find("getcontentlength", 1, true) ~= nil)
+end)
+
+test("client:list 能带回 created 字段", function()
+    FakeHttp.reset()
+    FakeHttp.handler = function(req)
+        return respond(req, 207, { body = CREATED_XML })
+    end
+    local client = WebDAV.client(SERVER)
+    local items, err = client:list("")
+    eq(err, nil)
+    eq(#items, 6)
+    eq(items[1].name, "z.txt")
+    eq(items[1].created, 1731403815, "created 应一路带到 client:list 的返回值里")
+    eq(items[3].created, nil, "缺值项保持 nil")
+end)
+
+-- ---------------------------------------------------------------------------
+-- creationdate 的降级重试（严格服务器拒绝未知属性时不能连累目录浏览）
+-- ---------------------------------------------------------------------------
+
+--- 模拟「不认识 creationdate 就整体报错」的严格服务器：
+-- 请求体含 creationdate 时返回指定错误码，否则正常返回 207。
+-- 同时把每次请求体记录到 level_bodies，便于断言「首次带 / 重试不带」。
+local level_bodies = {}
+local function strictServer(err_code, xml)
+    return function(req)
+        local sent = drainSource(req.source) or ""
+        level_bodies[#level_bodies + 1] = sent
+        if sent:find("creationdate", 1, true) then
+            return respond(req, err_code, { status = "HTTP/1.1 " .. err_code .. " Error" })
+        end
+        return respond(req, 207, { body = xml or [[<d:multistatus xmlns:d="DAV:"></d:multistatus>]] })
+    end
+end
+
+test("client:list 服务器拒绝 creationdate 时自动降级重试（400）", function()
+    FakeHttp.reset()
+    level_bodies = {}
+    FakeHttp.handler = strictServer(400)
+    local client = WebDAV.client(SERVER)
+    local items, err = client:list("")
+    eq(err, nil, "降级后应成功，不应把错误抛给界面")
+    ok(items ~= nil, "应返回列表")
+    eq(#FakeHttp.requests, 2, "应发生两次请求（带 creationdate + 基础体）")
+    -- 注意：handler 内部已经把 source 读空，这里改为回看 handler 记录的请求体
+    eq(level_bodies[2] and level_bodies[2]:find("creationdate", 1, true), nil,
+        "重试请求体不应再包含 creationdate")
+    ok(level_bodies[2] and level_bodies[2]:find("getlastmodified", 1, true) ~= nil,
+        "重试仍要请求基础属性")
+    ok(level_bodies[1] and level_bodies[1]:find("creationdate", 1, true) ~= nil,
+        "首次请求体应包含 creationdate")
+end)
+
+test("client:list 降级对各种拒绝码都生效（403/409/500）", function()
+    for _, code in ipairs({ 403, 409, 500 }) do
+        FakeHttp.reset()
+        FakeHttp.handler = strictServer(code)
+        local client = WebDAV.client(SERVER)
+        local items, err = client:list("")
+        eq(err, nil, "状态码 " .. code .. " 时应降级成功")
+        ok(items ~= nil, "状态码 " .. code .. " 时应返回列表")
+        eq(#FakeHttp.requests, 2, "状态码 " .. code .. " 时应重试一次")
+    end
+end)
+
+test("client:list 降级后记住该服务器，后续不再重复试探", function()
+    FakeHttp.reset()
+    FakeHttp.handler = strictServer(400)
+    local client = WebDAV.client(SERVER)
+    client:list("")
+    eq(#FakeHttp.requests, 2, "首次：先试探再降级")
+
+    FakeHttp.requests = {}
+    FakeHttp.handler = function(req)
+        local sent = drainSource(req.source) or ""
+        eq(sent:find("creationdate", 1, true), nil, "后续请求不应再带 creationdate")
+        return respond(req, 207, { body = [[<d:multistatus xmlns:d="DAV:"></d:multistatus>]] })
+    end
+    client:list("books")
+    eq(#FakeHttp.requests, 1, "第二次只需一次请求")
+end)
+
+test("client:list 降级只对「带 creationdate 失败」生效，真错误仍要报出", function()
+    FakeHttp.reset()
+    -- 两种体都报 500：说明不是 creationdate 的问题，应把错误报给调用方
+    FakeHttp.handler = function(req)
+        drainSource(req.source)
+        return respond(req, 500, { status = "HTTP/1.1 500 Internal Server Error" })
+    end
+    local client = WebDAV.client(SERVER)
+    local items, err = client:list("")
+    eq(items, nil, "应返回 nil")
+    ok(err ~= nil, "应返回错误")
+    contains(err, "500", "错误里应带状态码")
+    eq(#FakeHttp.requests, 2, "仍会重试一次（无法预知是否属性问题）")
+end)
+
+test("client:exists 也能容忍服务器拒绝 creationdate", function()
+    FakeHttp.reset()
+    FakeHttp.handler = strictServer(400, [[<d:multistatus xmlns:d="DAV:">
+      <d:response><d:href>/dav/books/</d:href>
+        <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+        <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+    </d:multistatus>]])
+    local client = WebDAV.client(SERVER)
+    local exists, is_folder, err = client:exists("books")
+    eq(err, nil, "降级后不该报错")
+    eq(exists, true, "应判定存在")
+    eq(is_folder, true, "应判定是目录")
+end)
+
+test("client:exists 的 404 不触发无谓重试", function()
+    FakeHttp.reset()
+    FakeHttp.handler = function(req)
+        drainSource(req.source)
+        return respond(req, 404, { status = "HTTP/1.1 404 Not Found" })
+    end
+    local client = WebDAV.client(SERVER)
+    local exists, is_folder, err = client:exists("nope")
+    eq(err, nil)
+    eq(exists, false, "404 表示不存在")
+    eq(#FakeHttp.requests, 1, "404 是有效答案，不该重试")
+end)
+
+-- ---------------------------------------------------------------------------
 -- 汇总
 -- ---------------------------------------------------------------------------
 

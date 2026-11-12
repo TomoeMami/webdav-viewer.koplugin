@@ -570,7 +570,9 @@ end
 --     dir       = "<当前列出的相对目录>"  用于给不含 base 前缀的 href 兜底拼路径
 --   }
 -- @return table|nil items, string|nil err
---     items = { { name=, is_folder=, size=, modified=, href=, path= }, ... }
+--     items = { { name=, is_folder=, size=, modified=, created=, href=, path= }, ... }
+--     created 是 DAV:creationdate 解析出的 unix 秒；服务器没返回或无法解析时为 nil
+--     （绝不会用 modified 冒充）。
 function M.parseMultiStatus(xml, options)
     options = options or {}
 
@@ -677,6 +679,9 @@ function M.parseMultiStatus(xml, options)
                     size = tonumber(size_text:match("^(%d+)"))
                 end
                 local modified = M.parseHttpDate(nodeText(firstDescendant(resp, "getlastmodified")))
+                -- 创建时间：DAV:creationdate（RFC 3339 格式）。解析失败/缺失时保持 nil，
+                -- 绝不用 modified 冒充 —— 排序时「创建时间」缺失项需要单独排最后。
+                local created = M.parseHttpDate(nodeText(firstDescendant(resp, "creationdate")))
 
                 local name = basename(rel or abs_path or href)
                 if name ~= "" and name ~= "." and name ~= ".." then
@@ -685,6 +690,7 @@ function M.parseMultiStatus(xml, options)
                         is_folder = is_folder,
                         size = size,
                         modified = modified,
+                        created = created,
                         href = href,
                         path = rel or joinRel(dir, name),
                     }
@@ -860,7 +866,21 @@ local function getDeps()
     return deps
 end
 
+-- 请求体分两套：
+--   PROPFIND_BODY        带 DAV:creationdate（用于「创建时间」排序）
+--   PROPFIND_BODY_BASIC  不带，只有最基础的三个属性
+--
+-- 为什么要两套：RFC 4918 规定服务器遇到不认识的属性必须逐属性返回 404，
+-- 但现实里存在少量严格/简陋的实现会直接对整个请求返回 400/403/500。
+-- 「创建时间」只是排序的可选项，绝不能因为它让整个目录都打不开，
+-- 所以 Client:list 在首次失败时用 BASIC 体重试一次，并记住该服务器不支持
+-- creationdate（后续请求直接走 BASIC，不再多花一次往返）。
 local PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?>\n'
+    .. '<d:propfind xmlns:d="DAV:"><d:prop>'
+    .. '<d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:creationdate/>'
+    .. '</d:prop></d:propfind>'
+
+local PROPFIND_BODY_BASIC = '<?xml version="1.0" encoding="utf-8"?>\n'
     .. '<d:propfind xmlns:d="DAV:"><d:prop>'
     .. '<d:resourcetype/><d:getcontentlength/><d:getlastmodified/>'
     .. '</d:prop></d:propfind>'
@@ -1003,8 +1023,11 @@ function Client:_perform(args)
 end
 
 --- 发一次 PROPFIND。
+-- @param url string 完整 URL
+-- @param depth string|number|nil Depth 头
+-- @param body string|nil 请求体；缺省用 PROPFIND_BODY（带 creationdate）
 -- @return code, headers, status_line, transport_err, body
-function Client:_propfind(url, depth)
+function Client:_propfind(url, depth, body)
     local deps = getDeps()
     local chunks = {}
     local code, headers, status_line, transport_err = self:_perform({
@@ -1015,7 +1038,7 @@ function Client:_propfind(url, depth)
             ["Depth"] = tostring(depth or "1"),
             ["Accept"] = "application/xml, text/xml, */*",
         },
-        body = PROPFIND_BODY,
+        body = body or PROPFIND_BODY,
         sink = makeTableSink(deps, chunks),
     })
     return code, headers, status_line, transport_err, table.concat(chunks)
@@ -1035,7 +1058,20 @@ function Client:list(path)
     local dir = normalizeRel(path)
     local url = M.joinUrl(self.address, dir, { trailing_slash = true })
 
-    local code, discard_headers, status_line, transport_err, body = self:_propfind(url, "1")
+    -- 已知该服务器不接受 creationdate 时直接走基础体重，省一次往返。
+    local body = self._no_creationdate and PROPFIND_BODY_BASIC or PROPFIND_BODY
+    local code, discard_headers, status_line, transport_err, resp_body = self:_propfind(url, "1", body)
+
+    -- 首次带上 creationdate 失败（非 207）：退回基础体重试一次。
+    -- 触发条件故意放宽到「任何非 207」，因为不同实现拒绝未知属性的状态码五花八门
+    -- （400/403/409/500 都见过）；重试一次的成本远低于让目录打不开。
+    if (not code or code ~= 207) and not self._no_creationdate then
+        self._no_creationdate = true
+        self:_log("warn", "WebDAV 服务器不接受 creationdate，退回基础属性请求")
+        code, discard_headers, status_line, transport_err, resp_body =
+            self:_propfind(url, "1", PROPFIND_BODY_BASIC)
+    end
+
     if not code then
         return nil, self:_transportError(transport_err)
     end
@@ -1043,7 +1079,7 @@ function Client:list(path)
         return nil, statusError(code, status_line, _("directory listing failed"))
     end
 
-    local items, err = M.parseMultiStatus(body, {
+    local items, err = M.parseMultiStatus(resp_body, {
         address = self.address,
         self_href = url,
         self_path = dir,
@@ -1294,7 +1330,15 @@ function Client:exists(path)
     local rel = normalizeRel(path)
     local url = M.joinUrl(self.address, rel)
 
-    local code, discard_headers, status_line, transport_err, body = self:_propfind(url, "0")
+    -- 只需要判断「存在与否 / 是不是目录」，不需要 creationdate：
+    -- 固定用基础体，避免无谓地踩到「服务器拒绝未知属性」的情况。
+    local body = self._no_creationdate and PROPFIND_BODY_BASIC or PROPFIND_BODY
+    local code, discard_headers, status_line, transport_err, resp_body = self:_propfind(url, "0", body)
+    if (not code or (code ~= 207 and code ~= 404)) and not self._no_creationdate then
+        self._no_creationdate = true
+        code, discard_headers, status_line, transport_err, resp_body =
+            self:_propfind(url, "0", PROPFIND_BODY_BASIC)
+    end
     if not code then
         return nil, nil, self:_transportError(transport_err)
     end
@@ -1307,13 +1351,13 @@ function Client:exists(path)
     end
 
     -- Depth:0 时服务器必须返回该资源自身；不过滤 self 条目
-    local items, err = M.parseMultiStatus(body, { address = self.address })
+    local items, err = M.parseMultiStatus(resp_body, { address = self.address })
     if not items then
         return nil, nil, err
     end
     if #items == 0 then
         -- 207 但没有任何可解析条目：部分服务器用 response 级 404 表示不存在
-        local failed = body:match("<[%w:%-_%.]*status[^>]*>%s*HTTP/[%d%.]+%s+(%d%d%d)")
+        local failed = resp_body:match("<[%w:%-_%.]*status[^>]*>%s*HTTP/[%d%.]+%s+(%d%d%d)")
         if tonumber(failed) == 404 then
             return false, nil, nil
         end

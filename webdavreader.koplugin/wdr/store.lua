@@ -312,4 +312,191 @@ end
 
 Store.ProgressStore = ProgressStore
 
+-- ---------------------------------------------------------------------------
+-- 通用 JSON 文档存储
+-- ---------------------------------------------------------------------------
+
+-- 为什么单独一套而不复用 ProgressStore：
+--   ProgressStore 的结构固定为 { version, files }，塞进「服务器 -> 目录数组」这类
+--   不同形状的文档会很别扭，且改动它会影响既有进度记录的行为。这里只抽象出
+--   「懒加载 / dirty / 损坏备份 / 落盘」这套通用骨架，语义与 ProgressStore 对齐：
+--     * 构造时不做任何 IO，第一次 load/getData 才读盘，且只读一次；
+--     * 无 path / 无 encoder / 无 decoder 时返回明确的失败信息，绝不抛错；
+--     * 损坏的 JSON 先备份成 <path>.corrupt-<时间戳>，再从 default_data 重建，
+--       避免用户的记录被静默清空；
+--     * flush 只在调用方显式要求时写盘，flushIfDirty 才看 dirty 标志。
+
+local JsonStore = {}
+JsonStore.__index = JsonStore
+
+local function defaultReadFile(path)
+    local fh = io.open(path, "r")
+    if not fh then return nil end
+    local content = fh:read("*all")
+    fh:close()
+    return content
+end
+
+local function defaultWriteFile(path, content)
+    local fh, err = io.open(path, "w")
+    if not fh then return nil, err end
+    fh:write(content)
+    fh:close()
+    return true
+end
+
+--- 创建通用 JSON 文档存储。
+-- @param opts table {
+--   path         = "<json 文件绝对路径>",
+--   default_data = function() return table end,   -- 可选，缺省为 {}
+--   readfile     = function(path) -> string|nil,  -- 可选，注入测试
+--   writefile    = function(path, content) -> ok, err, -- 可选
+--   encode       = function(table) -> string,     -- 可选，稍后 setCodec 注入也可
+--   decode       = function(string) -> table|nil, err, -- 可选
+-- }
+-- @return JsonStore
+function Store.newJsonStore(opts)
+    opts = opts or {}
+    local self = setmetatable({}, JsonStore)
+    self.path = opts.path
+    self._default_data = opts.default_data
+    -- 允许注入依赖，便于在桌面环境下单测
+    self._read = opts.readfile or defaultReadFile
+    self._write = opts.writefile or defaultWriteFile
+    self._encode = opts.encode
+    self._decode = opts.decode
+    self.data = nil
+    self.dirty = false
+    -- 私有：load 判定「不能安全覆盖磁盘内容」时置位（无解码器 / 读取异常），
+    -- flush 据此拒绝写入，避免把已有文件用默认数据冲掉。
+    self._blocked_flush = false
+    self._blocked_reason = nil
+    return self
+end
+
+--- 构造一份全新的默认数据（每次都是新 table，避免多个实例共享同一份）。
+function JsonStore:_defaultData()
+    if self._default_data then
+        local ok, data = pcall(self._default_data)
+        if ok and type(data) == "table" then
+            return data
+        end
+    end
+    return {}
+end
+
+--- 校准内部使用的 JSON 编解码器（延迟注入，便于先建实例后加载依赖）。
+function JsonStore:setCodec(encode, decode)
+    self._encode = encode
+    self._decode = decode
+end
+
+--- 懒加载数据文件。绝不抛错。
+-- @return boolean ok
+--   首次加载：文件不存在/为空 -> true；无 path、无解码器、读取异常、内容损坏 -> false。
+--   已加载时重复调用直接返回 true（与 ProgressStore 一致）。
+function JsonStore:load()
+    if self.data ~= nil then return true end
+    self.data = self:_defaultData()
+    if not self.path then
+        self._blocked_flush = true
+        self._blocked_reason = "no path"
+        return false
+    end
+    local ok_read, content = pcall(self._read, self.path)
+    if not ok_read then
+        -- 读取抛异常：不覆盖磁盘内容，也不做备份（拿不到原文）
+        self._blocked_flush = true
+        self._blocked_reason = "read failed"
+        return false
+    end
+    if not content or content == "" then
+        return true
+    end
+    if not self._decode then
+        -- 没有解码器时不覆盖磁盘内容，保持默认数据但标记「不可写」
+        self._blocked_flush = true
+        self._blocked_reason = "no decoder"
+        return false
+    end
+    local ok_decode, decoded = pcall(self._decode, content)
+    if not ok_decode or type(decoded) ~= "table" then
+        -- 文件损坏：备份原文件后从默认数据开始，避免用户数据被静默清空。
+        -- 备份成功后允许继续写（下次 flush 用新数据覆盖坏文件是安全的）。
+        self:_backupCorrupt(content)
+        return false
+    end
+    self.data = decoded
+    return true
+end
+
+function JsonStore:_backupCorrupt(content)
+    if not self.path or not content then return end
+    local backup = self.path .. ".corrupt-" .. os.date("%Y%m%d%H%M%S")
+    pcall(self._write, backup, content)
+end
+
+--- 取数据（懒加载）。
+-- @return table 永远返回 table（加载失败时是 default_data 的副本）
+function JsonStore:getData()
+    self:load()
+    return self.data
+end
+
+--- 整体替换数据并标记为需要落盘。
+-- @param data table|nil 非 table 时回落到 default_data
+-- @return table 当前数据
+function JsonStore:setData(data)
+    if type(data) == "table" then
+        self.data = data
+    else
+        self.data = self:_defaultData()
+    end
+    self.dirty = true
+    return self.data
+end
+
+--- 标记有改动（调用方直接改过 getData() 返回的 table 后必须调用）。
+function JsonStore:markDirty()
+    self.dirty = true
+    return self
+end
+
+--- @return boolean 是否有未落盘的改动
+function JsonStore:isDirty()
+    return self.dirty == true
+end
+
+--- 序列化并落盘。
+-- @return boolean ok, string|nil err
+--   ok=false 且 err 为 "no path" / "no encoder" / "decode blocked" / 编码或写入错误
+function JsonStore:flush()
+    if not self.path then return false, "no path" end
+    if not self._encode then return false, "no encoder" end
+    self:load()
+    if self._blocked_flush then
+        -- 例如没有解码器：直接用默认数据覆盖会把用户原有记录冲掉
+        return false, "decode blocked: " .. tostring(self._blocked_reason)
+    end
+    local ok_encode, content = pcall(self._encode, self.data)
+    if not ok_encode then return false, content end
+    if type(content) ~= "string" then return false, "encoder returned non-string" end
+    local ok_write, wrote, err = pcall(self._write, self.path, content)
+    if not ok_write then return false, tostring(wrote) end
+    if not wrote then return false, err or "write failed" end
+    self.dirty = false
+    return true
+end
+
+--- 只有真的改过才落盘。
+-- @return boolean ok, string|nil err
+function JsonStore:flushIfDirty()
+    if self.dirty then
+        return self:flush()
+    end
+    return true
+end
+
+Store.JsonStore = JsonStore
+
 return Store
