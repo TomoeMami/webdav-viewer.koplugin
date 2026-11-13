@@ -6,8 +6,8 @@
   ┌──────────────────────────────┐
   │ 服务器名      当前路径 · 排序 │  <- 标题栏（副标题带当前排序方式）
   ├──────────────────────────────┤
-  │ 📁 子目录/          [3 项]   │  <- 点击进入
-  │ 📄 三体.txt         42%  2MB │  <- 点击：下载到临时目录并打开阅读
+  │ ▣ 子目录/           [3 项]   │  <- 点击进入（行首图标见「列表行首图标」）
+  │ ▤ 三体.txt          42%  2MB │  <- 点击：下载到临时目录并打开阅读
   │ ...                          │     长按：删除 / 移动 / 重命名 / 详情
   └──────────────────────────────┘
   左按钮：目录菜单（上一级 / 刷新 / 排序 / 新建文件夹 / 切换服务器 / 缓存设置）
@@ -58,7 +58,44 @@ local History = require("wdr.history")
 local Sort = require("wdr.sort")
 local Store = require("wdr.store")
 
+--------------------------------------------------------------------------------
+-- 列表行首图标
+--------------------------------------------------------------------------------
+-- 选字规则（踩过的坑）：只能用 KOReader 自带回退字体里**真有字形**的字符。
+--
+-- KOReader 的界面文字并不走系统字体，而是固定一串回退字体
+-- （frontend/ui/font.lua 的 Font.fallbacks：
+--  NotoSans-Regular → NotoSansCJKsc-Regular → *ArabicUI → *DevanagariUI
+--  → *BengaliUI → nerdfonts/symbols.ttf → freefont/FreeSans → freefont/FreeSerif）。
+--
+-- 之前这里用的是两个 emoji：文件夹图标 U+1F4C1、文件图标 U+1F4C4。
+-- emoji 在**这 8 个字体里一个都没有字形**，于是设备上画出来是「方框+问号」(.notdef)。
+-- （注释里刻意不写出这两个字符本身，因为 tests/test_ui.lua 会扫描源码禁止 emoji，
+-- 写出来自己就把守卫用例弄红了。）
+-- 注意 Nerd Font 的图标（上游 KOReader 在 ui/widget/filechooser.lua 里用
+-- \u{F016}/\u{F114}）属于 Unicode 私有区 U+E000–U+F8FF，靠 symbols.ttf 兜底；
+-- 一旦该字体缺失/版本不符同样会变豆腐块，因此这里刻意不去依赖它。
+--
+-- 现在改用两个「基本多文种平面」的几何符号，它们在 NotoSansCJKsc-Regular.otf
+-- （回退链第 2 位，KOReader 各平台都必带，缺了它中文界面都显示不了）以及
+-- FreeSans 里都有字形，属于最保险的一档：
+--   ▣ U+25A3 方框内含实心方块 —— 像「装东西的容器」，用作目录
+--   ▤ U+25A4 方框内横线       —— 像「有文字的文档」，用作文件
+-- 二者形状互补（中心实心 vs 横向条纹），小字号下也能一眼区分目录与文件。
+--
+-- 以后要换图标：先确认字形存在再改，别再用 U+1F000 以上的 emoji。
+-- 校验方式（本机已验证）：
+--   python -c "from fontTools.ttLib import TTFont;
+--              print(0x25A3 in TTFont('fonts/noto/NotoSansCJKsc-Regular.otf').getBestCmap())"
+-- tests/test_ui.lua 里有回归用例扫描插件源码，禁止再出现 emoji / 私有区字符。
+local ICON_FOLDER = "▣"
+local ICON_FILE = "▤"
+
 local Browser = BookList:extend{
+    -- 行首图标（暴露成字段，便于单测断言与后续统一调整）
+    ICON_FOLDER = ICON_FOLDER,
+    ICON_FILE = ICON_FILE,
+
     -- 由 main.lua 注入
     plugin = nil,
     config = nil,
@@ -330,6 +367,9 @@ end
 function Browser:buildItemTable(items, path)
     local server = self.config:getServer(self.server_idx)
     local tbl = {}
+    -- 图标：实例字段优先（便于测试/子类覆盖），缺省回退模块常量，保证永远有值。
+    local icon_folder = self.ICON_FOLDER or ICON_FOLDER
+    local icon_file = self.ICON_FILE or ICON_FILE
     local sort_key_info = Sort.KEY_BY_ID[self.sort_key] or Sort.KEY_BY_ID[Sort.DEFAULT_KEY]
     local show_date = sort_key_info and sort_key_info.date_based
 
@@ -354,7 +394,7 @@ function Browser:buildItemTable(items, path)
     for item_idx, it in ipairs(items or {}) do
         if it.is_folder then
             table.insert(tbl, {
-                text = "📁 " .. it.name,
+                text = icon_folder .. " " .. it.name,
                 is_folder = true,
                 is_file = false,
                 remote_path = it.path or Store.joinRemotePath(path, it.name),
@@ -381,7 +421,7 @@ function Browser:buildItemTable(items, path)
                 table.insert(mandatory_parts, size_text)
             end
             table.insert(tbl, {
-                text = "📄 " .. it.name,
+                text = icon_file .. " " .. it.name,
                 is_file = true,
                 is_folder = false,
                 remote_path = it.path or Store.joinRemotePath(path, it.name),

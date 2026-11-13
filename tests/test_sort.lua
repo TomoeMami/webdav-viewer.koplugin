@@ -93,7 +93,7 @@ function M.run(T)
     local function file(name, opts)
         opts = opts or {}
         return {
-            text = (opts.text or ("📄 " .. name)),
+            text = (opts.text or ("▤ " .. name)),
             name = name,
             is_folder = false,
             is_file = true,
@@ -107,7 +107,7 @@ function M.run(T)
     local function folder(name, opts)
         opts = opts or {}
         return {
-            text = "📁 " .. name,
+            text = "▣ " .. name,
             name = name,
             is_folder = true,
             is_file = false,
@@ -321,13 +321,13 @@ function M.run(T)
 
         -- 名称也相同 → 用 text 兜底
         local a = file("dup.txt", { size = 5 })
-        a.text = "📄 dup.txt (b)"
+        a.text = "▤ dup.txt (b)"
         local b = file("dup.txt", { size = 5 })
-        b.text = "📄 dup.txt (a)"
+        b.text = "▤ dup.txt (a)"
         local dup = { a, b }
         Sort.sortItems(dup, { key = "size" })
-        T.eq(dup[1].text, "📄 dup.txt (a)", "名称相同用 text 兜底")
-        T.eq(dup[2].text, "📄 dup.txt (b)")
+        T.eq(dup[1].text, "▤ dup.txt (a)", "名称相同用 text 兜底")
+        T.eq(dup[2].text, "▤ dup.txt (b)")
     end)
 
     T.test("sortItems：未知 key 回退 name，opts 为 nil / 非表不抛错", function()

@@ -2340,6 +2340,152 @@ case("排序持久化 E：KOReader 的 onFlushSettings 也不得抹掉排序", f
     eq(plugin:readSetting("last_server_idx"), idx, "flush 后服务器索引仍在")
 end)
 
+--------------------------------------------------------------------------------
+-- 用例：列表行首图标（回归：emoji 图标在 KOReader 字体链里没有字形 → 方框+问号）
+--------------------------------------------------------------------------------
+-- 背景见 TECHNICAL.md「行首图标为什么不用 emoji」：
+-- KOReader 界面文字只走它自带的回退字体链（Font.fallbacks），📁(U+1F4C1)/
+-- 📄(U+1F4C4) 在这些字体里没有字形，设备上显示成 .notdef（方框+问号）。
+-- 现在改用 NotoSansCJKsc 里确实有字形的几何符号：▣(U+25A3) / ▤(U+25A4)。
+
+--- 解码 UTF-8 字符串为码位数组（Lua 5.1 没有 utf8 库）
+local function codepoints(s)
+    local out = {}
+    local i, n = 1, #s
+    while i <= n do
+        local c = s:byte(i)
+        local cp, len
+        if c < 0x80 then
+            cp, len = c, 1
+        elseif c < 0xE0 then
+            cp, len = c % 0x20, 2
+        elseif c < 0xF0 then
+            cp, len = c % 0x10, 3
+        elseif c < 0xF8 then
+            cp, len = c % 0x08, 4
+        else
+            cp, len = c % 0x04, 5
+        end
+        for k = 1, len - 1 do
+            local cc = s:byte(i + k)
+            if not cc then break end
+            cp = cp * 0x40 + (cc % 0x40)
+        end
+        out[#out + 1] = cp
+        i = i + len
+    end
+    return out
+end
+
+--- 递归收集插件目录下的 .lua 文件（相对当前工作目录）。lfs 不可用时退回固定清单。
+local function pluginLuaFiles()
+    local files = {}
+    local ok_lfs, lfs = pcall(require, "lfs")
+    if ok_lfs then
+        local function walk(dir)
+            local ok_dir, iter, state = pcall(lfs.dir, dir)
+            if not ok_dir then return end
+            for entry in iter, state do
+                if entry ~= "." and entry ~= ".." then
+                    local full = dir .. "/" .. entry
+                    local mode = lfs.attributes(full, "mode")
+                    if mode == "directory" then
+                        walk(full)
+                    elseif mode == "file" and entry:sub(-4) == ".lua" then
+                        files[#files + 1] = full
+                    end
+                end
+            end
+        end
+        walk("webdavreader.koplugin")
+    end
+    if #files == 0 then
+        -- 兜底清单：lfs 加载失败时至少覆盖关键文件
+        for _, name in ipairs({
+            "main.lua", "_meta.lua",
+            "wdr/browser.lua", "wdr/sort.lua", "wdr/history.lua", "wdr/cache.lua",
+            "wdr/config.lua", "wdr/progress.lua", "wdr/store.lua", "wdr/session.lua",
+            "wdr/manager.lua", "wdr/webdav.lua", "wdr/json.lua",
+        }) do
+            files[#files + 1] = "webdavreader.koplugin/" .. name
+        end
+    end
+    return files
+end
+
+local function readFile(path)
+    local fh = io.open(path, "rb")
+    if not fh then return nil end
+    local content = fh:read("*a")
+    fh:close()
+    return content
+end
+
+case("行首图标：目录用 ▣(U+25A3)、文件用 ▤(U+25A4)", function()
+    local Browser = dofile("webdavreader.koplugin/wdr/browser.lua")
+
+    -- 图标以字段形式暴露，便于统一调整/断言
+    eq(Browser.ICON_FOLDER, "▣", "目录图标应是 ▣")
+    eq(Browser.ICON_FILE, "▤", "文件图标应是 ▤")
+    eq(codepoints(Browser.ICON_FOLDER)[1], 0x25A3, "目录图标码位应是 U+25A3")
+    eq(codepoints(Browser.ICON_FILE)[1], 0x25A4, "文件图标码位应是 U+25A4")
+
+    local browser = Browser:new{
+        plugin = { config = Config },
+        config = Config,
+        progress = Progress,
+        cache = Cache,
+    }
+    browser:init()
+    browser.server_idx = 1
+
+    local tbl = browser:buildItemTable({
+        { name = "sub", is_folder = true, path = "sub" },
+        { name = "三体.txt", is_folder = false, path = "三体.txt", size = 2048 },
+    }, "")
+
+    eq(#tbl, 2, "应有目录 + 文件两项")
+    eq(tbl[1].is_folder, true, "前置：目录排第一")
+
+    -- 目录行：行首必须是 ▣ + 空格，名字原样保留
+    local folder_cps = codepoints(tbl[1].text)
+    eq(folder_cps[1], 0x25A3, "目录行行首应是 ▣（U+25A3），实际：" .. tostring(tbl[1].text))
+    eq(tbl[1].text, "▣ sub", "目录行文案")
+    eq(folder_cps[2], 0x20, "图标与名称之间应有一个空格")
+
+    -- 文件行：行首必须是 ▤ + 空格
+    local file_cps = codepoints(tbl[2].text)
+    eq(file_cps[1], 0x25A4, "文件行行首应是 ▤（U+25A4），实际：" .. tostring(tbl[2].text))
+    eq(tbl[2].text, "▤ 三体.txt", "文件行文案")
+    eq(file_cps[2], 0x20, "图标与名称之间应有一个空格")
+
+    -- 行首图标既不是 emoji 也不是私有区字符（那两类才会渲染成方框+问号）
+    for _, cp in ipairs({ folder_cps[1], file_cps[1] }) do
+        ok(cp < 0x1F000, string.format("图标不应落在 emoji 区（U+%04X）", cp))
+        ok(not (cp >= 0xE000 and cp <= 0xF8FF), string.format("图标不应落在私有区（U+%04X）", cp))
+    end
+end)
+
+case("源码守卫：插件内不得使用 emoji / Nerd Font 私有区字符当图标", function()
+    local files = pluginLuaFiles()
+    ok(#files >= 10, "应能枚举到插件源码文件，实际找到 " .. #files .. " 个")
+
+    local bad = {}
+    for _, path in ipairs(files) do
+        local content = readFile(path)
+        if content then
+            for _, cp in ipairs(codepoints(content)) do
+                -- U+1F000 以上：emoji / 星形平面；U+E000–U+F8FF：Nerd Font 私有区
+                if cp >= 0x1F000 or (cp >= 0xE000 and cp <= 0xF8FF) then
+                    bad[#bad + 1] = string.format("%s 含 U+%04X", path, cp)
+                end
+            end
+        end
+    end
+    ok(#bad == 0,
+        "KOReader 自带字体里没有这些字形，会显示成方框+问号：\n      " .. table.concat(bad, "\n      "))
+end)
+
 -- ---------------------------------------------------------------------------
 -- 汇总
 -- ---------------------------------------------------------------------------

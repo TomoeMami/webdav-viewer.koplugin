@@ -264,11 +264,16 @@ Sort.compareTypes(a, b)            -- 先比小写扩展名，相同再比名称
 item 字段约定（由 `browser.lua:buildItemTable` 构造）：
 
 ```
-文件：{ text=, name=, is_folder=false, is_file=true, remote_path=, filesize=, modification=, created= }
-目录：{ text=, name=, is_folder=true, is_file=false, remote_path= }
+文件：{ text="▤ <name>", name=, is_folder=false, is_file=true, remote_path=, filesize=, modification=, created= }
+目录：{ text="▣ <name>", name=, is_folder=true, is_file=false, remote_path= }
 置顶：{ text="⬆ ../", name="..", is_go_up=true, is_folder=false, is_file=false, remote_path=<上一级> }
       -- 仅在 #dir_stack > 1（非根目录）时插入，恒在最前
 ```
+
+行首图标由 `Browser.ICON_FOLDER`（`▣` U+25A3）/ `Browser.ICON_FILE`（`▤` U+25A4）决定。
+**图标字符必须挑 KOReader 自带回退字体里真有字形的字符**（详见 TECHNICAL.md
+「行首图标为什么不用 emoji」）：emoji（U+1F000 以上）与 Nerd Font 私有区
+（U+E000–U+F8FF）都可能渲染成方框+问号。`tests/test_ui.lua` 有源码守卫用例。
 
 比较函数返回 `true` 表示「a 应排在 b 前面」，相等返回 `false`。`compareModified` / `compareCreated` 是**内建新→旧**的比较器，`sortItems` 在需要时自行取反（`reverse = (descending ~= spec.descending)`），调用方不要自己去反转。
 

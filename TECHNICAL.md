@@ -241,6 +241,44 @@ adb push webdavreader.koplugin /sdcard/koreader/plugins/
 | 服务器直接拒绝带 creationdate 的 PROPFIND | 已自动降级：`Client:list` 收到非 207 后改用基础请求体重试并记住该服务器，目录浏览不受影响 |
 | 移动历史里的目标目录已失效（改名/删除） | 主菜单 → WebDAV 远程阅读 → 移动位置记录，逐条移除或清空；只影响快捷位置，不动服务器文件 |
 | 桌面测试全绿但设备上崩 | 桌面测试用的是 `tests/*_stubs.lua` 模拟 KOReader，覆盖不到真实 KOReader 的接口版本差异，务必以设备实测为准 |
+| 列表行首图标显示成「方框+问号」 | 用了 emoji 当图标（如 `📁`/`📄`），而 KOReader 的回退字体链里没有 emoji 字形。见下方「行首图标为什么不用 emoji」 |
+
+### 行首图标为什么不用 emoji
+
+`wdr/browser.lua` 的 `buildItemTable` 给目录行/文件行加了行首图标。图标字符**必须**挑
+KOReader 自带回退字体里真有字形的字符，否则设备上会画成 `.notdef`（方框/问号）。
+
+KOReader 的界面文字不走系统字体，而是 `frontend/ui/font.lua` 里固定的一串回退字体
+（`Font.fallbacks`，按顺序回退）：
+
+| 序号 | 文件 |
+|---|---|
+| 1 | `NotoSans-Regular.ttf` |
+| 2 | `NotoSansCJKsc-Regular.otf`（中文界面必需，各平台都带） |
+| 3–5 | `NotoSansArabicUI/BengaliUI/DevanagariUI-Regular.ttf` |
+| 6 | `nerdfonts/symbols.ttf` |
+| 7–8 | `freefont/FreeSans.ttf`、`freefont/FreeSerif.ttf` |
+
+历史问题：之前用 emoji `📁`(U+1F4C1) / `📄`(U+1F4C4)，**这 8 个字体里一个都没有**这两码位
+（已用 `fontTools` 逐个 cmap 核对），所以渲染成「方框+问号」。
+
+现在的选择（都在第 2 位的 `NotoSansCJKsc-Regular.otf` 里，属最保险一档）：
+
+| 用途 | 字符 | 码位 | 为什么 |
+|---|---|---|---|
+| 目录 | `▣` | U+25A3 方框内含实心方块 | 像「装东西的容器」；与文件图标形状互补（中心实心 vs 横向条纹） |
+| 文件 | `▤` | U+25A4 方框内横线 | 像「有文字的文档」 |
+
+补充说明：
+
+- **Nerd Font 图标**（上游 KOReader 在 `ui/widget/filechooser.lua:306` 用 `\u{F016}`、
+  `:308` 用 `\u{F114}` 标文件/子目录数）落在 Unicode 私有区 U+E000–U+F8FF，靠第 6 位的
+  `nerdfonts/symbols.ttf` 兜底。它能用，但**依赖一个可选字体**：字体缺失或版本不符就是豆腐块，
+  故本插件不采用（且用户明确要求用普通 Unicode 字符）。
+- 其余已在用的符号都验证过有字形：`⬆`(U+2B06) `★`(U+2605) `✓`(U+2713) `↑`/`↓`(U+2191/2193)。
+- `tests/test_ui.lua` 里有回归用例**扫描插件源码**，出现 emoji（U+1F000 以上）或私有区字符即失败，
+  防止以后又改回 emoji。
+- 想换图标时先验证字形：`python -c "from fontTools.ttLib import TTFont; print(0x25A3 in TTFont('NotoSansCJKsc-Regular.otf').getBestCmap())"`。
 
 ## 设计取舍（为什么不用官方 cloudstorage）
 
@@ -258,3 +296,4 @@ adb push webdavreader.koplugin /sdcard/koreader/plugins/
 |---|---|
 | 未发版 | 首个公开版本：浏览/直接打开/进度/缓存/远程文件管理、多服务器 |
 | 未发版 | 目录排序（6 种排序键 + 升降序 + 目录优先，选择会记住）与移动位置历史（每服务器 20 条 MRU） |
+| 未发版 | 修复列表行首图标显示成「方框+问号」：原 emoji（U+1F4C1/U+1F4C4）在 KOReader 回退字体里无字形，改为 `▣`(U+25A3)/`▤`(U+25A4)，并加源码守卫用例 |
